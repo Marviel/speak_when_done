@@ -11,6 +11,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from . import speak as speak_fn
+from . import list_voices as list_voices_fn
 
 # Configure logging to stderr (never stdout - it corrupts JSON-RPC)
 logging.basicConfig(
@@ -55,6 +56,24 @@ def speak(message: str, voice: str = "alba") -> dict:
         logger.error(f"Speech failed: {result.get('error')}")
 
     return result
+
+
+@mcp.tool()
+def list_voices() -> dict:
+    """
+    List available voices for text-to-speech.
+
+    Use this tool to discover what voices are available before using the speak tool.
+    Returns a list of built-in voice names and information about custom voice cloning.
+
+    Returns:
+        Dictionary with:
+        - builtin_voices: List of available voice names with descriptions
+        - default_voice: The default voice used if none specified
+        - custom_voice_hint: Instructions for using custom voices
+    """
+    logger.info("Listing available voices")
+    return list_voices_fn()
 
 
 def run_server():
