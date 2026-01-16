@@ -19,16 +19,20 @@ def main():
         description="Speak text aloud using Pocket TTS with automatic cleanup",
     )
     parser.add_argument(
-        "--text", "-t",
+        "--text",
+        "-t",
+        required=True,
         help="The text to speak aloud",
     )
     parser.add_argument(
-        "--voice", "-v",
+        "--voice",
+        "-v",
         default="alba",
         help="Voice to use (default: alba). Can be a voice name or path to audio file for cloning.",
     )
     parser.add_argument(
-        "--quiet", "-q",
+        "--quiet",
+        "-q",
         action="store_true",
         help="Suppress pocket-tts output",
     )
