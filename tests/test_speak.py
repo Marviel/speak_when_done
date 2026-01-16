@@ -3,7 +3,6 @@
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from speak_when_done import speak
 
@@ -105,7 +104,9 @@ class TestSpeak:
 
     @patch("speak_when_done.subprocess.run")
     @patch("speak_when_done.os.unlink")
-    def test_speak_cleans_up_temp_file(self, mock_unlink: MagicMock, mock_run: MagicMock):
+    def test_speak_cleans_up_temp_file(
+        self, mock_unlink: MagicMock, mock_run: MagicMock
+    ):
         """Test that temp file is cleaned up after playback."""
         mock_run.return_value = MagicMock(returncode=0, stderr="")
 
@@ -116,7 +117,9 @@ class TestSpeak:
 
     @patch("speak_when_done.subprocess.run")
     @patch("speak_when_done.os.unlink")
-    def test_speak_cleans_up_on_failure(self, mock_unlink: MagicMock, mock_run: MagicMock):
+    def test_speak_cleans_up_on_failure(
+        self, mock_unlink: MagicMock, mock_run: MagicMock
+    ):
         """Test that temp file is cleaned up even on failure."""
         mock_run.return_value = MagicMock(returncode=1, stderr="TTS error")
 

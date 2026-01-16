@@ -34,10 +34,15 @@ def speak(message: str, voice: str = "alba", quiet: bool = False) -> dict:
 
         # Call pocket-tts via uvx
         cmd = [
-            "uvx", "pocket-tts", "generate",
-            "--text", message,
-            "--voice", voice,
-            "--output-path", output_path,
+            "uvx",
+            "pocket-tts",
+            "generate",
+            "--text",
+            message,
+            "--voice",
+            voice,
+            "--output-path",
+            output_path,
         ]
         if quiet:
             cmd.append("--quiet")

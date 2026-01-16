@@ -37,7 +37,9 @@ class TestCLI:
         """Test CLI with custom voice."""
         mock_speak.return_value = {"success": True}
 
-        with patch("sys.argv", ["speak_when_done", "--text", "Hello", "--voice", "tom"]):
+        with patch(
+            "sys.argv", ["speak_when_done", "--text", "Hello", "--voice", "tom"]
+        ):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 0
