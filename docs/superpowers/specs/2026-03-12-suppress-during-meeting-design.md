@@ -59,11 +59,13 @@ The `suppress_in_meeting=False` escape hatch lets library users override the beh
   - Add `is_microphone_active() -> bool` function
   - Add `suppress_in_meeting: bool = True` parameter to `speak()`
   - Add early-return check at the top of `speak()`
+- `speak_when_done/cli.py`:
+  - Handle the `suppressed` return case — currently `cli.py` accesses `result["error"]` on failure, which would `KeyError` on a suppressed return. Check for `result.get("suppressed")` and print an appropriate message instead.
+- `speak_when_done/server.py`:
+  - Handle the `suppressed` return case in logging — currently logs `Speech failed: {result.get('error')}` which would show `None` for suppressed returns. Log a distinct message for suppressed calls.
 
 ### What does NOT change
 
-- `server.py` — the MCP `speak` tool calls `speak_fn()` which gets the new behavior automatically
-- `cli.py` — CLI calls `speak()` which gets the new behavior automatically
 - No new dependencies
 - No new files
 
