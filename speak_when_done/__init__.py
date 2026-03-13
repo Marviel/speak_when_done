@@ -4,6 +4,8 @@ speak_when_done - Text-to-speech with automatic temp file handling.
 Generates speech using Kyutai's Pocket TTS, plays it, and cleans up.
 """
 
+import ctypes
+import ctypes.util
 import os
 import shutil
 import subprocess
@@ -57,6 +59,92 @@ def list_voices() -> dict:
         "default_voice": "alba",
         "custom_voice_hint": "You can also use a path to an audio file for voice cloning.",
     }
+
+
+def is_microphone_active() -> bool:
+    """
+    Check if any microphone is currently in use on macOS.
+
+    Uses CoreAudio API to query all audio input devices.
+    Returns False on non-macOS platforms.
+    """
+    if sys.platform != "darwin":
+        return False
+
+    try:
+        ca = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+        )
+    except OSError:
+        return False
+
+    class AudioObjectPropertyAddress(ctypes.Structure):
+        _fields_ = [
+            ("mSelector", ctypes.c_uint32),
+            ("mScope", ctypes.c_uint32),
+            ("mElement", ctypes.c_uint32),
+        ]
+
+    AUDIO_OBJECT_SYSTEM_OBJECT = 1
+    SCOPE_GLOBAL = 0x676C6F62   # 'glob'
+    SCOPE_INPUT = 0x696E7074    # 'inpt'
+    PROP_DEVICES = 0x64657623   # 'dev#'
+    PROP_STREAMS = 0x73746D23   # 'stm#'
+    PROP_RUNNING_SOMEWHERE = 0x676F6E65  # 'gone'
+
+    # Get all audio device IDs
+    addr = AudioObjectPropertyAddress(PROP_DEVICES, SCOPE_GLOBAL, 0)
+    size = ctypes.c_uint32(0)
+    err = ca.AudioObjectGetPropertyDataSize(
+        AUDIO_OBJECT_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size)
+    )
+    if err != 0 or size.value == 0:
+        return False
+
+    num_devices = size.value // 4
+    devices = (ctypes.c_uint32 * num_devices)()
+    err = ca.AudioObjectGetPropertyData(
+        AUDIO_OBJECT_SYSTEM_OBJECT,
+        ctypes.byref(addr),
+        0,
+        None,
+        ctypes.byref(size),
+        ctypes.byref(devices),
+    )
+    if err != 0:
+        return False
+
+    # Check each device for active input
+    for i in range(num_devices):
+        dev = devices[i]
+
+        # Does this device have input streams?
+        stream_addr = AudioObjectPropertyAddress(PROP_STREAMS, SCOPE_INPUT, 0)
+        stream_size = ctypes.c_uint32(0)
+        err = ca.AudioObjectGetPropertyDataSize(
+            dev, ctypes.byref(stream_addr), 0, None, ctypes.byref(stream_size)
+        )
+        if err != 0 or stream_size.value == 0:
+            continue
+
+        # Is any process using this input device?
+        run_addr = AudioObjectPropertyAddress(
+            PROP_RUNNING_SOMEWHERE, SCOPE_GLOBAL, 0
+        )
+        is_running = ctypes.c_uint32(0)
+        run_size = ctypes.c_uint32(4)
+        err = ca.AudioObjectGetPropertyData(
+            dev,
+            ctypes.byref(run_addr),
+            0,
+            None,
+            ctypes.byref(run_size),
+            ctypes.byref(is_running),
+        )
+        if err == 0 and is_running.value == 1:
+            return True
+
+    return False
 
 
 def _get_audio_player() -> list[str] | None:
