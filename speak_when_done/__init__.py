@@ -129,7 +129,10 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
     return {"success": True}
 
 
-def speak(message: str, voice: str = "alba", quiet: bool = False) -> dict:
+DEFAULT_VOICE = os.environ.get("SPEAK_WHEN_DONE_VOICE", "alba")
+
+
+def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False) -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
