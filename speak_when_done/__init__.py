@@ -217,7 +217,7 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
     return {"success": True}
 
 
-def speak(message: str, voice: str = "alba", quiet: bool = False) -> dict:
+def speak(message: str, voice: str = "alba", quiet: bool = False, suppress_in_meeting: bool = True) -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
@@ -233,6 +233,14 @@ def speak(message: str, voice: str = "alba", quiet: bool = False) -> dict:
     Returns:
         Dictionary with success status and details.
     """
+    # Check if mic is active (meeting in progress) — macOS only
+    if suppress_in_meeting and sys.platform == "darwin" and is_microphone_active():
+        return {
+            "success": False,
+            "suppressed": True,
+            "reason": "microphone in use",
+        }
+
     # Check for audio player before doing any work
     player_cmd = _get_audio_player()
     if player_cmd is None:
