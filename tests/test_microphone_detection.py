@@ -83,3 +83,35 @@ def test_speak_suppression_skipped_on_non_darwin():
 
     mock_mic.assert_not_called()
     assert result["success"] is True
+
+
+def test_cli_handles_suppressed_result(capsys):
+    """CLI prints suppression message instead of crashing on KeyError."""
+    from speak_when_done.cli import main
+
+    suppressed_result = {"success": False, "suppressed": True, "reason": "microphone in use"}
+
+    with patch("speak_when_done.cli.speak", return_value=suppressed_result), \
+         patch("sys.argv", ["speak_when_done", "--text", "Hello"]), \
+         pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "microphone in use" in captured.err
+
+
+def test_cli_handles_normal_error(capsys):
+    """CLI still prints normal errors correctly."""
+    from speak_when_done.cli import main
+
+    error_result = {"success": False, "error": "TTS generation failed"}
+
+    with patch("speak_when_done.cli.speak", return_value=error_result), \
+         patch("sys.argv", ["speak_when_done", "--text", "Hello"]), \
+         pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "TTS generation failed" in captured.err

@@ -58,7 +58,10 @@ def main():
     result = speak(args.text, voice=args.voice, quiet=args.quiet)
 
     if not result["success"]:
-        print(f"Error: {result['error']}", file=sys.stderr)
+        if result.get("suppressed"):
+            print(f"Suppressed: {result['reason']}", file=sys.stderr)
+        else:
+            print(f"Error: {result['error']}", file=sys.stderr)
         sys.exit(1)
 
     sys.exit(0)
