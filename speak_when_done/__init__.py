@@ -54,7 +54,7 @@ def list_voices() -> dict:
     return {
         "success": True,
         "builtin_voices": BUILTIN_VOICES,
-        "default_voice": "alba",
+        "default_voice": DEFAULT_VOICE,
         "custom_voice_hint": "You can also use a path to an audio file for voice cloning.",
     }
 
