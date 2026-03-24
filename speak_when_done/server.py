@@ -52,6 +52,8 @@ def speak(message: str, voice: str = "alba") -> dict:
 
     if result["success"]:
         logger.info("Message spoken successfully")
+    elif result.get("suppressed"):
+        logger.info(f"Speech suppressed: {result.get('reason')}")
     else:
         logger.error(f"Speech failed: {result.get('error')}")
 
