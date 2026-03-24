@@ -56,7 +56,7 @@ def list_voices() -> dict:
     return {
         "success": True,
         "builtin_voices": BUILTIN_VOICES,
-        "default_voice": "alba",
+        "default_voice": DEFAULT_VOICE,
         "custom_voice_hint": "You can also use a path to an audio file for voice cloning.",
     }
 
@@ -217,7 +217,9 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
     return {"success": True}
 
 
-def speak(message: str, voice: str = "alba", quiet: bool = False, suppress_in_meeting: bool = True) -> dict:
+DEFAULT_VOICE = os.environ.get("SPEAK_WHEN_DONE_VOICE", "alba")
+
+def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppress_in_meeting: bool = True) -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
