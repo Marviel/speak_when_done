@@ -50,14 +50,7 @@ def load_profiles() -> dict[str, dict[str, Any]]:
     if config_path is None:
         return DEFAULT_PROFILES.copy()
 
-    try:
-        import yaml
-    except ImportError:
-        print(
-            "PyYAML required for voice profiles. Install with: pip install pyyaml",
-            file=sys.stderr,
-        )
-        return DEFAULT_PROFILES.copy()
+    import yaml
 
     with open(config_path) as f:
         raw = yaml.safe_load(f)
@@ -66,16 +59,23 @@ def load_profiles() -> dict[str, dict[str, Any]]:
         return DEFAULT_PROFILES.copy()
 
     profiles = DEFAULT_PROFILES.copy()
-    voice_profiles = raw.get("voices", raw)
+    voice_profiles = raw.get("voices", {})
+    if not isinstance(voice_profiles, dict):
+        return profiles
 
     for name, cfg in voice_profiles.items():
         if not isinstance(cfg, dict):
             continue
+        try:
+            speed = float(cfg.get("speed", 1.0))
+        except (ValueError, TypeError):
+            print(f"Warning: invalid speed for profile '{name}', using 1.0", file=sys.stderr)
+            speed = 1.0
         profiles[name] = {
             "voice": cfg.get("voice", "alba"),
-            "speed": float(cfg.get("speed", 1.0)),
+            "speed": speed,
             "persona": cfg.get("persona", ""),
-            "warmup": cfg.get("warmup", "... ..."),
+            "warmup": cfg.get("warmup", ""),
         }
 
     return profiles
@@ -97,7 +97,10 @@ def _load_raw_config() -> dict:
         with open(config_path) as f:
             raw = yaml.safe_load(f)
         return raw if isinstance(raw, dict) else {}
-    except (ImportError, Exception):
+    except ImportError:
+        return {}
+    except Exception as e:
+        print(f"Warning: failed to load config {config_path}: {e}", file=sys.stderr)
         return {}
 
 

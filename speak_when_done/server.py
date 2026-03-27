@@ -51,17 +51,23 @@ def speak(message: str, voice: str = "", profile: str = "") -> dict:
         Dictionary with success status and details.
     """
     # Resolve profile — agent can only choose if config allows it
-    if profile and agent_can_choose_voice():
+    can_choose = agent_can_choose_voice()
+    if profile and can_choose:
         profile_name = profile
     else:
         profile_name = get_default_profile_name()
     prof = get_profile(profile_name)
 
-    use_voice = voice or (prof["voice"] if prof else "alba")
+    # When agent can't choose, also ignore the voice param
+    if can_choose:
+        use_voice = voice or (prof["voice"] if prof else "alba")
+    else:
+        use_voice = prof["voice"] if prof else "alba"
     speed = prof["speed"] if prof else 1.0
     warmup = prof["warmup"] if prof else ""
 
-    logger.info(f"Speaking message: {message[:50]}... (profile={profile_name})")
+    truncated = f"{message[:50]}..." if len(message) > 50 else message
+    logger.info(f"Speaking message: {truncated} (profile={profile_name})")
     result = speak_fn(message, voice=use_voice, quiet=True, speed=speed, warmup=warmup)
 
     if result["success"]:

@@ -163,12 +163,10 @@ def _get_audio_player() -> list[str] | None:
         if shutil.which("afplay"):
             return ["afplay"]
     elif platform == "win32":
-        # Windows: use PowerShell to play audio
-        # This uses the built-in .NET audio player
-        return [
-            "powershell", "-c",
-            "(New-Object Media.SoundPlayer '{path}').PlaySync()"
-        ]
+        # Windows: use PowerShell with -File or script block
+        # Path is passed as a separate argument to avoid injection
+        return ["powershell", "-NoProfile", "-Command",
+                "[System.Media.SoundPlayer]::new($args[0]).PlaySync()", "-args"]
     else:
         # Linux/BSD: try common audio players in order of preference
         linux_players = [
@@ -195,13 +193,7 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
     Returns:
         Dictionary with success status and any error details.
     """
-    # Handle Windows PowerShell which needs the path embedded in the command
-    if "powershell" in player_cmd[0].lower():
-        # Replace {path} placeholder with actual path
-        cmd = [arg.replace("{path}", audio_path) for arg in player_cmd]
-    else:
-        # For other players, append the path as an argument
-        cmd = player_cmd + [audio_path]
+    cmd = player_cmd + [audio_path]
 
     play_result = subprocess.run(
         cmd,
@@ -257,35 +249,69 @@ def _get_cached_voice(voice_path: str) -> str:
         if cached.exists():
             return str(cached)
 
-        # Export voice to safetensors
+        # Export voice to safetensors atomically (temp file then rename)
+        tmp_cached = VOICE_CACHE_DIR / f".tmp_{stem}_{source_hash}_{os.getpid()}.safetensors"
         result = subprocess.run(
-            ["uvx", "pocket-tts", "export-voice", voice_path, str(cached), "--quiet"],
+            ["uvx", "pocket-tts", "export-voice", voice_path, str(tmp_cached), "--quiet"],
             capture_output=True,
             text=True,
             timeout=60,
         )
-        if result.returncode == 0 and cached.exists():
+        if result.returncode == 0 and tmp_cached.exists():
+            tmp_cached.rename(cached)
             return str(cached)
 
+        # Clean up failed temp file
+        try:
+            tmp_cached.unlink(missing_ok=True)
+        except OSError:
+            pass
         return voice_path
     except Exception:
         return voice_path
 
 
 def _apply_speed(audio_path: str, speed: float) -> str | None:
-    """Speed up/slow down a WAV file using ffmpeg. Returns path to new file or None on failure."""
+    """Speed up/slow down a WAV file using ffmpeg. Returns path to new file or None on failure.
+
+    ffmpeg's atempo filter supports 0.5-2.0 per stage. For values outside
+    that range, we chain multiple atempo filters.
+    """
     if speed == 1.0:
         return None
 
-    import tempfile
-    fast_path = tempfile.mktemp(suffix=".wav")
+    if speed <= 0:
+        return None
+
+    # Clamp to reasonable range
+    speed = max(0.5, min(speed, 4.0))
+
+    # Build atempo filter chain — each stage handles 0.5-2.0x
+    filters = []
+    remaining = speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining}")
+    filter_chain = ",".join(filters)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        fast_path = tmp.name
+
     result = subprocess.run(
-        ["ffmpeg", "-i", audio_path, "-filter:a", f"atempo={speed}", "-y", fast_path],
+        ["ffmpeg", "-i", audio_path, "-filter:a", filter_chain, "-y", fast_path],
         capture_output=True,
         text=True,
         timeout=30,
     )
     if result.returncode != 0:
+        try:
+            os.unlink(fast_path)
+        except OSError:
+            pass
         return None
     return fast_path
 
@@ -329,6 +355,7 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
         }
 
     output_path = None
+    fast_path = None
     try:
         # Create a temp file for the output audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -403,9 +430,10 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
             "error": str(e),
         }
     finally:
-        # Always clean up the temp file
-        if output_path:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        # Always clean up temp files
+        for path in (output_path, fast_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
