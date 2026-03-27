@@ -147,7 +147,9 @@ You can clone any voice by passing a path to an audio file (WAV or MP3):
 speak_when_done --text "Hello" --voice /path/to/sample.wav
 ```
 
-Only the first 30 seconds of the audio file are used. For faster repeated use, pre-export to safetensors with [pocket-tts](https://github.com/kyutai-labs/pocket-tts):
+Only the first 30 seconds of the audio file are used. Voice cloning exports are **automatically cached** as safetensors files in `~/.cache/speak_when_done/voices/`. The first call with a new voice file takes ~5 extra seconds for the export; subsequent calls use the cache. The cache auto-invalidates when the source audio file changes (keyed by SHA256).
+
+You can also manually pre-export with [pocket-tts](https://github.com/kyutai-labs/pocket-tts):
 ```bash
 uvx pocket-tts export-voice clip.mp3 my_voice.safetensors
 speak_when_done --text "Hello" --voice my_voice.safetensors
