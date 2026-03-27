@@ -6,7 +6,9 @@ Generates speech using Kyutai's Pocket TTS, plays it, and cleans up.
 
 import ctypes
 import ctypes.util
+import hashlib
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -161,12 +163,10 @@ def _get_audio_player() -> list[str] | None:
         if shutil.which("afplay"):
             return ["afplay"]
     elif platform == "win32":
-        # Windows: use PowerShell to play audio
-        # This uses the built-in .NET audio player
-        return [
-            "powershell", "-c",
-            "(New-Object Media.SoundPlayer '{path}').PlaySync()"
-        ]
+        # Windows: use PowerShell with -File or script block
+        # Path is passed as a separate argument to avoid injection
+        return ["powershell", "-NoProfile", "-Command",
+                "[System.Media.SoundPlayer]::new($args[0]).PlaySync()", "-args"]
     else:
         # Linux/BSD: try common audio players in order of preference
         linux_players = [
@@ -193,13 +193,7 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
     Returns:
         Dictionary with success status and any error details.
     """
-    # Handle Windows PowerShell which needs the path embedded in the command
-    if "powershell" in player_cmd[0].lower():
-        # Replace {path} placeholder with actual path
-        cmd = [arg.replace("{path}", audio_path) for arg in player_cmd]
-    else:
-        # For other players, append the path as an argument
-        cmd = player_cmd + [audio_path]
+    cmd = player_cmd + [audio_path]
 
     play_result = subprocess.run(
         cmd,
@@ -219,7 +213,112 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
 
 DEFAULT_VOICE = os.environ.get("SPEAK_WHEN_DONE_VOICE", "alba")
 
-def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppress_in_meeting: bool = True) -> dict:
+
+VOICE_CACHE_DIR = Path.home() / ".cache" / "speak_when_done" / "voices"
+
+
+def _get_cached_voice(voice_path: str) -> str:
+    """Return path to a cached safetensors file for a voice audio file.
+
+    Computes SHA256 of the source file, checks for a cached export,
+    and generates one via pocket-tts export-voice if missing or stale.
+    Returns the original path if it's already a .safetensors file or if
+    caching fails.
+    """
+    # Already a safetensors file — no caching needed
+    if voice_path.endswith(".safetensors"):
+        return voice_path
+
+    # Not a local file (built-in voice name or URL) — skip caching
+    if not os.path.isfile(voice_path):
+        return voice_path
+
+    try:
+        VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Hash the source file
+        h = hashlib.sha256()
+        with open(voice_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        source_hash = h.hexdigest()[:16]
+
+        stem = Path(voice_path).stem
+        cached = VOICE_CACHE_DIR / f"{stem}_{source_hash}.safetensors"
+
+        if cached.exists():
+            return str(cached)
+
+        # Export voice to safetensors atomically (temp file then rename)
+        tmp_cached = VOICE_CACHE_DIR / f".tmp_{stem}_{source_hash}_{os.getpid()}.safetensors"
+        result = subprocess.run(
+            ["uvx", "pocket-tts", "export-voice", voice_path, str(tmp_cached), "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0 and tmp_cached.exists():
+            tmp_cached.rename(cached)
+            return str(cached)
+
+        # Clean up failed temp file
+        try:
+            tmp_cached.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return voice_path
+    except Exception:
+        return voice_path
+
+
+def _apply_speed(audio_path: str, speed: float) -> str | None:
+    """Speed up/slow down a WAV file using ffmpeg. Returns path to new file or None on failure.
+
+    ffmpeg's atempo filter supports 0.5-2.0 per stage. For values outside
+    that range, we chain multiple atempo filters.
+    """
+    if speed == 1.0:
+        return None
+
+    if speed <= 0:
+        return None
+
+    # Clamp to reasonable range
+    speed = max(0.5, min(speed, 4.0))
+
+    # Build atempo filter chain — each stage handles 0.5-2.0x
+    filters = []
+    remaining = speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining}")
+    filter_chain = ",".join(filters)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        fast_path = tmp.name
+
+    result = subprocess.run(
+        ["ffmpeg", "-i", audio_path, "-filter:a", filter_chain, "-y", fast_path],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        try:
+            os.unlink(fast_path)
+        except OSError:
+            pass
+        return None
+    return fast_path
+
+
+def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
+          suppress_in_meeting: bool = True, speed: float = 1.0,
+          warmup: str = "") -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
@@ -231,6 +330,8 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
         voice: Voice to use (default: "alba"). Can be a built-in voice name
                or path to an audio file for voice cloning.
         quiet: If True, suppress pocket-tts output.
+        speed: Playback speed multiplier (default: 1.0). Requires ffmpeg.
+        warmup: Text prepended to message for voice cloning warmup (e.g. "... ...").
 
     Returns:
         Dictionary with success status and details.
@@ -254,16 +355,23 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
         }
 
     output_path = None
+    fast_path = None
     try:
         # Create a temp file for the output audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             output_path = tmp.name
 
+        # Prepend warmup text if provided
+        tts_text = f"{warmup} {message}" if warmup else message
+
+        # Use cached safetensors if available
+        resolved_voice = _get_cached_voice(voice)
+
         # Call pocket-tts via uvx
         cmd = [
             "uvx", "pocket-tts", "generate",
-            "--text", message,
-            "--voice", voice,
+            "--text", tts_text,
+            "--voice", resolved_voice,
             "--output-path", output_path,
         ]
         if quiet:
@@ -282,8 +390,21 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
                 "error": f"TTS generation failed: {result.stderr}",
             }
 
+        # Apply speed adjustment if needed
+        play_path = output_path
+        fast_path = None
+        if speed != 1.0:
+            fast_path = _apply_speed(output_path, speed)
+            if fast_path:
+                play_path = fast_path
+
         # Play the audio file
-        play_result = _play_audio(player_cmd, output_path)
+        play_result = _play_audio(player_cmd, play_path)
+        if fast_path:
+            try:
+                os.unlink(fast_path)
+            except OSError:
+                pass
         if not play_result["success"]:
             return play_result
 
@@ -309,9 +430,10 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
             "error": str(e),
         }
     finally:
-        # Always clean up the temp file
-        if output_path:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        # Always clean up temp files
+        for path in (output_path, fast_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
