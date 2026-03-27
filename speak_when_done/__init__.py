@@ -6,7 +6,9 @@ Generates speech using Kyutai's Pocket TTS, plays it, and cleans up.
 
 import ctypes
 import ctypes.util
+import hashlib
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -220,6 +222,56 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
 DEFAULT_VOICE = os.environ.get("SPEAK_WHEN_DONE_VOICE", "alba")
 
 
+VOICE_CACHE_DIR = Path.home() / ".cache" / "speak_when_done" / "voices"
+
+
+def _get_cached_voice(voice_path: str) -> str:
+    """Return path to a cached safetensors file for a voice audio file.
+
+    Computes SHA256 of the source file, checks for a cached export,
+    and generates one via pocket-tts export-voice if missing or stale.
+    Returns the original path if it's already a .safetensors file or if
+    caching fails.
+    """
+    # Already a safetensors file — no caching needed
+    if voice_path.endswith(".safetensors"):
+        return voice_path
+
+    # Not a local file (built-in voice name or URL) — skip caching
+    if not os.path.isfile(voice_path):
+        return voice_path
+
+    try:
+        VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Hash the source file
+        h = hashlib.sha256()
+        with open(voice_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        source_hash = h.hexdigest()[:16]
+
+        stem = Path(voice_path).stem
+        cached = VOICE_CACHE_DIR / f"{stem}_{source_hash}.safetensors"
+
+        if cached.exists():
+            return str(cached)
+
+        # Export voice to safetensors
+        result = subprocess.run(
+            ["uvx", "pocket-tts", "export-voice", voice_path, str(cached), "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0 and cached.exists():
+            return str(cached)
+
+        return voice_path
+    except Exception:
+        return voice_path
+
+
 def _apply_speed(audio_path: str, speed: float) -> str | None:
     """Speed up/slow down a WAV file using ffmpeg. Returns path to new file or None on failure."""
     if speed == 1.0:
@@ -285,11 +337,14 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
         # Prepend warmup text if provided
         tts_text = f"{warmup} {message}" if warmup else message
 
+        # Use cached safetensors if available
+        resolved_voice = _get_cached_voice(voice)
+
         # Call pocket-tts via uvx
         cmd = [
             "uvx", "pocket-tts", "generate",
             "--text", tts_text,
-            "--voice", voice,
+            "--voice", resolved_voice,
             "--output-path", output_path,
         ]
         if quiet:
