@@ -219,7 +219,28 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
 
 DEFAULT_VOICE = os.environ.get("SPEAK_WHEN_DONE_VOICE", "alba")
 
-def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppress_in_meeting: bool = True) -> dict:
+
+def _apply_speed(audio_path: str, speed: float) -> str | None:
+    """Speed up/slow down a WAV file using ffmpeg. Returns path to new file or None on failure."""
+    if speed == 1.0:
+        return None
+
+    import tempfile
+    fast_path = tempfile.mktemp(suffix=".wav")
+    result = subprocess.run(
+        ["ffmpeg", "-i", audio_path, "-filter:a", f"atempo={speed}", "-y", fast_path],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    return fast_path
+
+
+def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
+          suppress_in_meeting: bool = True, speed: float = 1.0,
+          warmup: str = "") -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
@@ -231,6 +252,8 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
         voice: Voice to use (default: "alba"). Can be a built-in voice name
                or path to an audio file for voice cloning.
         quiet: If True, suppress pocket-tts output.
+        speed: Playback speed multiplier (default: 1.0). Requires ffmpeg.
+        warmup: Text prepended to message for voice cloning warmup (e.g. "... ...").
 
     Returns:
         Dictionary with success status and details.
@@ -259,10 +282,13 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             output_path = tmp.name
 
+        # Prepend warmup text if provided
+        tts_text = f"{warmup} {message}" if warmup else message
+
         # Call pocket-tts via uvx
         cmd = [
             "uvx", "pocket-tts", "generate",
-            "--text", message,
+            "--text", tts_text,
             "--voice", voice,
             "--output-path", output_path,
         ]
@@ -282,8 +308,21 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False, suppres
                 "error": f"TTS generation failed: {result.stderr}",
             }
 
+        # Apply speed adjustment if needed
+        play_path = output_path
+        fast_path = None
+        if speed != 1.0:
+            fast_path = _apply_speed(output_path, speed)
+            if fast_path:
+                play_path = fast_path
+
         # Play the audio file
-        play_result = _play_audio(player_cmd, output_path)
+        play_result = _play_audio(player_cmd, play_path)
+        if fast_path:
+            try:
+                os.unlink(fast_path)
+            except OSError:
+                pass
         if not play_result["success"]:
             return play_result
 
