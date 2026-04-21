@@ -252,7 +252,7 @@ def _get_cached_voice(voice_path: str) -> str:
         # Export voice to safetensors atomically (temp file then rename)
         tmp_cached = VOICE_CACHE_DIR / f".tmp_{stem}_{source_hash}_{os.getpid()}.safetensors"
         result = subprocess.run(
-            ["uvx", "pocket-tts", "export-voice", voice_path, str(tmp_cached), "--quiet"],
+            ["uvx", "pocket-tts@1.1.1", "export-voice", voice_path, str(tmp_cached), "--quiet"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -369,7 +369,7 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
 
         # Call pocket-tts via uvx
         cmd = [
-            "uvx", "pocket-tts", "generate",
+            "uvx", "pocket-tts@1.1.1", "generate",
             "--text", tts_text,
             "--voice", resolved_voice,
             "--output-path", output_path,
