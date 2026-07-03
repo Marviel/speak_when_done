@@ -55,9 +55,12 @@ uvx --from git+https://github.com/Marviel/speak_when_done speak_when_done -t "He
 | `-w` | `--warmup` | Text prepended for voice cloning warmup |
 | `-q` | `--quiet` | Suppress TTS output |
 | | `--ignore-meeting` | Speak even if microphone is active |
-| `-l` | `--list-voices` | List built-in voices |
+| `-l` | `--list-voices` | List built-in voices, personas, and the active worktree persona |
 | | `--list-profiles` | List configured voice profiles |
 | | `--profile-json` | Output resolved profile as JSON |
+| | `--validate-personas` | Check persona files against `PERSONA_VOICES`; exit non-zero on drift |
+| | `--tail [N]` | Show the last N call-log records (observability) |
+| | `--tail-desync [N]` | Show the last N drift events (empty output is the goal) |
 
 ### Python library
 
@@ -223,6 +226,46 @@ Config is also settable via environment variables:
 - `SPEAK_WHEN_DONE_CONFIG` — path to config file
 - `SPEAK_WHEN_DONE_PROFILE` — default profile name
 - `SPEAK_WHEN_DONE_AGENT_CAN_CHOOSE` — `true`/`false`
+
+## Per-worktree personas
+
+For multi-agent setups (many concurrent coding-agent sessions, each in its own
+git worktree), speak_when_done can give every worktree a stable, distinct
+**persona**: a full spoken register (who the character is, how triumph/failure/
+tedium bend them, what to avoid) paired with a voice, a speed, and a language.
+
+- **Registers live in `personas/`** — one Markdown file per persona, plus
+  `_common.md` for shared discipline and TTS-friendly writing rules. The files
+  are re-read on every call, so edits apply without a restart. The audio
+  plumbing (voice path, speed, language, fallback tagline) lives in
+  `PERSONA_VOICES` in `speak_when_done/__init__.py`.
+- **Assignment is deterministic**: SHA-256 of the worktree path over the sorted
+  roster. The same worktree always gets the same persona, across sessions and
+  restarts. Callers pass their `cwd`; when they can't, the library walks up the
+  process tree to discover it.
+- **Persona and voice resolve together** (`_resolve_active_persona_and_voice`),
+  so the register that composed the message and the timbre that speaks it can
+  never drift apart. Runtime drift checks (`drift` in every response) plus an
+  offline validator (`speak_when_done --validate-personas`) catch mismatches:
+  missing voice files, orphaned or thin register files, wrong headers.
+- **Cloned voices** go in `~/.claude/voices/<persona>.safetensors` (override
+  with `SPEAK_WHEN_DONE_VOICES_DIR`). A persona whose file is missing falls
+  back to the `alba` builtin voice but keeps its register. Three personas
+  (`flightdeck`, `gumshoe`, `expediter`) use Pocket TTS builtin voices and work
+  with no cloned files at all.
+- **Observability**: every `speak()`/`list_voices()` call appends a JSONL
+  record to `logs/calls.jsonl` (drift events also go to `logs/desync.jsonl`).
+  Inspect with `speak_when_done --tail` / `--tail-desync`.
+
+Agents consume this through `list_voices()`: the response includes
+`active_persona` and `active_style` (the shared discipline + the active
+persona's full register) so the agent can compose its spoken sign-off in
+character before calling `speak`.
+
+Env overrides: `SPEAK_WHEN_DONE_PERSONA_DIR`, `SPEAK_WHEN_DONE_VOICES_DIR`,
+`SPEAK_WHEN_DONE_LOG_DIR`, `SPEAK_WHEN_DONE_LANGUAGE`, `SPEAK_WHEN_DONE_VOICE`
+(a persona's safetensors path locks that persona; a builtin name keeps the
+worktree persona's register but swaps the timbre).
 
 ## Meeting suppression
 
