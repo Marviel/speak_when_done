@@ -275,6 +275,59 @@ Env overrides: `SPEAK_WHEN_DONE_PERSONA_DIR`, `SPEAK_WHEN_DONE_VOICES_DIR`,
 (a persona's safetensors path locks that persona; a builtin name keeps the
 worktree persona's register but swaps the timbre).
 
+## Shared warm daemon (multi-session setups)
+
+With many concurrent agent sessions, one stdio MCP server per session means
+one Python process per session, each re-loading the TTS model cold on every
+notification. `speak_when_done/daemon.py` collapses all of that into **one
+long-running process** that keeps the Pocket TTS model and every persona's
+voice state resident in memory and serves the same `speak` / `list_voices`
+tools over **streamable-HTTP MCP**:
+
+```bash
+uv sync --extra daemon
+uv run python -m speak_when_done.daemon   # serves http://127.0.0.1:9876/mcp
+```
+
+Point every session at it instead of spawning a stdio server, e.g. in Claude
+Code's MCP config:
+
+```json
+{ "mcpServers": { "speak_when_done": { "type": "http", "url": "http://127.0.0.1:9876/mcp" } } }
+```
+
+For always-on use, wrap it in a LaunchAgent (macOS) or systemd user unit with
+keep-alive; persona `.md` files are re-read on every call and need no restart.
+
+**Async FIFO queue.** `speak` validates, enqueues, and returns immediately
+(`queued: true`, `position: N`) with the resolved persona identity fields. One
+background worker synthesizes and plays strictly in arrival order, so audio
+from different sessions never overlaps and no MCP request ever blocks on the
+(potentially slow) TTS model. This replaced synchronous in-request synthesis
+after a paged-out model made a single generation take 12.5 minutes, stacking
+every other call behind the generation lock until the clients timed out.
+
+- **Stale-drop**: messages older than `SPEAK_WHEN_DONE_STALE_AFTER_S` (600) at
+  dequeue time are dropped and logged instead of playing ancient notifications
+  after a stall.
+- **Keep-warm**: after `SPEAK_WHEN_DONE_KEEP_WARM_IDLE_S` (600) of queue
+  idleness the worker runs a tiny throwaway generation to page-touch the model
+  weights so they don't get evicted (the root cause of the 12.5-minute
+  synthesis). Keep-alives are never played.
+- **Synthesis watchdog**: a single generation exceeding
+  `SPEAK_WHEN_DONE_SYNTH_WATCHDOG_S` (45) logs a WARNING mid-flight — the
+  memory-pressure signature — and the final duration on exit.
+- **Backpressure**: the queue holds `SPEAK_WHEN_DONE_QUEUE_MAX` (20) messages;
+  beyond that, `speak` returns an error instead of silently piling up.
+- Mic-suppression is evaluated at playback time, not enqueue time.
+- `SPEAK_WHEN_DONE_HOST` / `SPEAK_WHEN_DONE_PORT` bind the endpoint
+  (default 127.0.0.1:9876).
+
+The daemon reuses the library's persona resolution, per-persona speed
+stretch, cross-session playback lock, and drift logging unchanged — it only
+swaps the synthesis backend (via the `_GENERATOR` hook) from a cold
+`uvx pocket-tts` subprocess to the resident model.
+
 ## Meeting suppression
 
 On macOS, speech is automatically suppressed when a microphone is active (e.g. during a video call). Override with `--ignore-meeting`.
