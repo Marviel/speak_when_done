@@ -257,6 +257,14 @@ tedium bend them, what to avoid) paired with a voice, a speed, and a language.
   record to `logs/calls.jsonl` (drift events also go to `logs/desync.jsonl`).
   Inspect with `speak_when_done --tail` / `--tail-desync`.
 
+- **Pinning**: `personas/assignments.json` (machine-local, gitignored; format
+  in `personas/assignments.example.json`) pins specific worktrees to specific
+  personas. Pins win over the hash and are re-read on every call. This is both
+  the manual override and the roster-expansion safety net: the hash is modular
+  over the roster size, so adding a persona would reshuffle every existing
+  worktree's voice — pin the worktrees you know about first, then grow the
+  roster.
+
 Agents consume this through `list_voices()`: the response includes
 `active_persona` and `active_style` (the shared discipline + the active
 persona's full register) so the agent can compose its spoken sign-off in

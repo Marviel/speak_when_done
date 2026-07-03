@@ -539,9 +539,60 @@ def validate_persona_sync(persona_dir: str = _PERSONA_DIR) -> dict:
     }
 
 
+# Personas that existed before the 2026-07-02 roster expansion. Worktrees
+# already active by then were pinned (personas/assignments.json) to the
+# assignment this frozen list produces, because the hash below is modular over
+# the roster size — adding personas would otherwise reshuffle EVERY existing
+# worktree's voice. Never edit this tuple; if the roster grows again, re-seed
+# pins for all then-known worktrees first (over the then-current roster).
+_LEGACY_PERSONAS = (
+    "aghdashloo",
+    "attenborough",
+    "elliott",
+    "gottfried",
+    "herzog",
+    "mcconaughey",
+)
+
+# Per-worktree persona pins: {"pins": {worktree_path: persona_name}}. Read on
+# every call (like the persona files), so edits apply without a restart. Also
+# the manual override point — pin any worktree to any persona by editing it.
+# The file is machine-local state and gitignored; see
+# personas/assignments.example.json for the format. Missing file == no pins.
+_ASSIGNMENTS_PATH = os.path.join(_PERSONA_DIR, "assignments.json")
+
+
+def _legacy_persona_for_worktree(cwd: str) -> str:
+    """Assignment under the pre-2026-07-02 six-persona roster (pin seeding)."""
+    names = sorted(_LEGACY_PERSONAS)
+    h = hashlib.sha256(cwd.encode()).digest()
+    return names[h[0] % len(names)]
+
+
+def _load_persona_pins() -> dict[str, str]:
+    """Read persona pins from assignments.json. Best-effort; {} on any error.
+
+    Pins naming a persona that no longer exists are ignored (falls through to
+    the hash) rather than crashing resolution.
+    """
+    try:
+        with open(_ASSIGNMENTS_PATH, encoding="utf-8") as f:
+            pins = json.load(f).get("pins", {})
+        return {wt: p for wt, p in pins.items() if p in PERSONA_VOICES}
+    except (OSError, ValueError):
+        return {}
+
+
 def _pick_persona_for_worktree(cwd: str | None) -> str:
-    """Deterministic persona selection: SHA-256 of the worktree path over the
-    sorted roster, so each worktree gets a stable persona across sessions.
+    """Deterministic persona selection.
+
+    Order of precedence:
+    1. An explicit pin in personas/assignments.json (protects existing
+       worktrees' assignments across roster expansions, and doubles as the
+       manual-override mechanism).
+    2. SHA-256 of the worktree path over the FULL current roster (so each new
+       worktree gets a stable persona across sessions, and new personas are
+       reachable).
 
     When cwd discovery fails, fall back to a hash of (hostname, ppid) instead
     of alphabetical-first — otherwise every cwd-discovery failure collapses to
@@ -558,6 +609,9 @@ def _pick_persona_for_worktree(cwd: str | None) -> str:
             ppid=os.getppid(),
         )
         return names[h[0] % len(names)]
+    pinned = _load_persona_pins().get(cwd)
+    if pinned is not None:
+        return pinned
     h = hashlib.sha256(cwd.encode()).digest()
     return names[h[0] % len(names)]
 

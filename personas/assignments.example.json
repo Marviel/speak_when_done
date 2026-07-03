@@ -1,0 +1,7 @@
+{
+  "_comment": "Per-worktree persona pins. Copy to assignments.json (gitignored, machine-local) to pin worktrees to personas. Pins win over the worktree-path hash and are re-read on every call. Primary use: when the persona roster grows, the modular hash would reshuffle every existing worktree's voice — seed a pin for each already-known worktree with its current assignment first, then add the new personas. Pins naming an unknown persona are ignored.",
+  "pins": {
+    "/Users/you/projects/my-app": "gumshoe",
+    "/Users/you/projects/my-app/.claude/worktrees/example-worktree": "flightdeck"
+  }
+}
