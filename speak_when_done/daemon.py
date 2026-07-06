@@ -30,6 +30,8 @@ to the resident model.
 
 import contextlib
 import dataclasses
+import http.server
+import json
 import logging
 import os
 import queue
@@ -37,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 import speak_when_done as swd
 from speak_when_done import DEFAULT_LANGUAGE, PERSONA_VOICES
@@ -76,7 +79,7 @@ KEEP_WARM_TEXT = "Okay."
 _models: dict[str, object] = {}
 _states: dict[tuple[str, str], object] = {}
 _model_lock = threading.Lock()  # guards model construction
-_gen_lock = threading.Lock()    # serializes generation (the model isn't reentrant)
+_gen_lock = threading.Lock()  # serializes generation (the model isn't reentrant)
 
 
 def _get_model(language: str):
@@ -124,7 +127,8 @@ def _synthesis_watchdog(label: str):
         logger.warning(
             "synthesis (%s) exceeding %.0fs — model weights likely paged out "
             "under memory pressure; audio will play when it finishes",
-            label, threshold,
+            label,
+            threshold,
         )
 
     timer = threading.Timer(threshold, _bark)
@@ -139,7 +143,9 @@ def _synthesis_watchdog(label: str):
         if elapsed >= threshold:
             logger.warning(
                 "synthesis (%s) took %.1fs (threshold %.0fs)",
-                label, elapsed, threshold,
+                label,
+                elapsed,
+                threshold,
             )
 
 
@@ -150,8 +156,9 @@ def _warm_generate(message: str, voice: str, language: str, output_path: str) ->
 
     model = _get_model(language)
     state = _get_state(language, voice)
-    with _gen_lock, _synthesis_watchdog(
-        f"voice={os.path.basename(voice)} chars={len(message)}"
+    with (
+        _gen_lock,
+        _synthesis_watchdog(f"voice={os.path.basename(voice)} chars={len(message)}"),
     ):
         chunks = model.generate_audio_stream(
             model_state=state,
@@ -164,6 +171,12 @@ def _warm_generate(message: str, voice: str, language: str, output_path: str) ->
 
 # Route swd.speak() synthesis through the resident model instead of `uvx`.
 swd._GENERATOR = _warm_generate
+
+# This daemon runs for days. An in-process CoreAudio query goes stale in a
+# long-lived process (it misses mic on/off transitions and spoke over a live
+# meeting on 2026-07-05) — so force the mic check into a fresh subprocess, which
+# always reads the current state. See swd.MIC_CHECK_FRESH.
+swd.MIC_CHECK_FRESH = True
 
 
 # ---- Async FIFO speak queue -------------------------------------------------
@@ -219,7 +232,9 @@ def _enqueue_speak(message: str, cwd: str | None, voice: str | None) -> dict:
         except queue.Full:
             logger.error(
                 "speak queue full (%d pending); rejecting: %s... (cwd=%s)",
-                _speak_queue.qsize(), message[:50], cwd,
+                _speak_queue.qsize(),
+                message[:50],
+                cwd,
             )
             return {
                 "success": False,
@@ -253,7 +268,10 @@ def _process_item(item: _QueuedSpeak) -> None:
     if age > STALE_AFTER_S:
         logger.warning(
             "dropping stale queued message (age %.0fs > %.0fs cutoff): %s... (cwd=%s)",
-            age, STALE_AFTER_S, item.message[:50], item.cwd,
+            age,
+            STALE_AFTER_S,
+            item.message[:50],
+            item.cwd,
         )
         swd._log_event(
             "speak_dropped_stale",
@@ -266,7 +284,8 @@ def _process_item(item: _QueuedSpeak) -> None:
     if result.get("success"):
         logger.info(
             "spoken (persona=%s, waited %.1fs in queue)",
-            result.get("persona"), age,
+            result.get("persona"),
+            age,
         )
     elif result.get("suppressed"):
         logger.info("suppressed: %s", result.get("reason"))
@@ -293,7 +312,8 @@ def _keep_warm() -> None:
             _warm_generate(KEEP_WARM_TEXT, voice, language, out)
             logger.info(
                 "keep-warm generation ok (language=%s, %.1fs)",
-                language, time.monotonic() - start,
+                language,
+                time.monotonic() - start,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("keep-warm generation failed (language=%s): %s", language, e)
@@ -328,6 +348,349 @@ def _start_worker() -> threading.Thread:
     thread = threading.Thread(target=_worker_loop, name="speak-worker", daemon=True)
     thread.start()
     return thread
+
+
+# ---- Control server (browser pause UI) --------------------------------------
+# A tiny stdlib HTTP server on its own port serving a one-page control panel and
+# a JSON control API, so the user can pause/mute notifications on demand — even
+# when NOT in a meeting. Pause state is file-backed in the shared library
+# (swd.get_pause_state / swd.set_pause), so the worker's playback-time check and
+# this UI always agree. Kept on a SEPARATE port from the MCP endpoint so it
+# never interferes with the JSON-RPC transport.
+
+CONTROL_HOST = os.environ.get("SPEAK_WHEN_DONE_CONTROL_HOST", "127.0.0.1")
+CONTROL_PORT = int(os.environ.get("SPEAK_WHEN_DONE_CONTROL_PORT", "9877"))
+
+# The fresh mic check spawns a subprocess; cache it briefly so an open browser
+# tab polling /status doesn't fork one every few seconds.
+_mic_cache: dict[str, float | bool] = {"value": False, "at": 0.0}
+_MIC_CACHE_TTL_S = 2.0
+
+
+def _mic_active_cached() -> bool:
+    now = time.monotonic()
+    if now - float(_mic_cache["at"]) > _MIC_CACHE_TTL_S:
+        _mic_cache["value"] = swd.is_microphone_active()
+        _mic_cache["at"] = now
+    return bool(_mic_cache["value"])
+
+
+_HISTORY_KINDS = {
+    "speak": "spoken",
+    "speak_suppressed": "suppressed",
+    "speak_dropped_stale": "dropped",
+}
+
+
+def _recent_speaks(limit: int = 40) -> list[dict]:
+    """Recent speak-related events, newest first, from the tail of the call log.
+
+    persona / text are OPTIONAL — not every caller sets a persona, and rows
+    logged before text capture have no text. The UI renders around whatever is
+    present.
+    """
+    path = swd._CALL_LOG
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            back = min(size, 500_000)  # only the tail; the log grows unbounded
+            f.seek(size - back)
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = chunk.splitlines()
+    if back < size and lines:
+        lines = lines[1:]  # drop the partial first line from a mid-file seek
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= limit:
+            break
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        kind = _HISTORY_KINDS.get(r.get("event"))
+        if kind is None:
+            continue
+        wt = (r.get("worktree") or "").rstrip("/")
+        out.append(
+            {
+                "ts": r.get("ts"),
+                "kind": kind,
+                "reason": r.get("reason"),
+                "persona": r.get("persona"),
+                "text": r.get("text"),
+                "chars": r.get("message_chars"),
+                "worktree": os.path.basename(wt) if wt else None,
+            }
+        )
+    return out
+
+
+def _status_dict(*, with_history: bool = True) -> dict:
+    state = swd.get_pause_state()
+    until = state.get("until")
+    until_iso = None
+    seconds_left = None
+    if until is not None:
+        seconds_left = max(0, int(float(until) - time.time()))
+        until_iso = time.strftime("%H:%M", time.localtime(float(until)))
+    out = {
+        "paused": state["paused"],
+        "until": until,
+        "until_iso": until_iso,
+        "seconds_left": seconds_left,
+        "reason": state.get("reason"),
+        "mic_active": _mic_active_cached(),
+        "queue_depth": _speak_queue.qsize(),
+    }
+    if with_history:
+        out["recent"] = _recent_speaks()
+    return out
+
+
+_CONTROL_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>speak when done</title>
+<style>
+  :root{
+    --bg:#0e1013; --card:#16191f; --fg:#e7e9ee; --muted:#8b929c; --faint:#5b626c;
+    --line:#252a32; --hover:#1d212a; --accent:#6b8cff;
+    --ok:#35d29a; --warn:#f2b03d; --stop:#ff6b6b;
+  }
+  :root[data-theme="dark"]{ color-scheme:dark; }
+  @media (prefers-color-scheme:light){
+    :root{ --bg:#eef1f5; --card:#fff; --fg:#141822; --muted:#697180; --faint:#9aa2ae;
+           --line:#e6e9ef; --hover:#f5f7fa; --accent:#3b6bff; }
+  }
+  :root[data-theme="light"]{ --bg:#eef1f5; --card:#fff; --fg:#141822; --muted:#697180;
+    --faint:#9aa2ae; --line:#e6e9ef; --hover:#f5f7fa; --accent:#3b6bff; color-scheme:light; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+        font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+        display:flex; align-items:flex-start; justify-content:center; padding:28px 16px;
+        -webkit-font-smoothing:antialiased; }
+  .card{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
+         border-radius:20px; padding:22px; box-shadow:0 10px 40px rgba(0,0,0,.18); }
+  header{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .brand{ font-size:13px; font-weight:600; letter-spacing:.3px; color:var(--muted); }
+  .qd{ font-size:11px; color:var(--faint); }
+
+  .hero{ display:flex; align-items:center; gap:13px; margin-bottom:18px; }
+  .dot{ width:12px; height:12px; border-radius:50%; flex:0 0 auto; background:var(--faint);
+        transition:background .25s, box-shadow .25s; }
+  .is-on   .dot{ background:var(--ok);   box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 18%,transparent); }
+  .is-mic  .dot{ background:var(--warn); box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 18%,transparent); }
+  .is-mute .dot{ background:var(--stop); box-shadow:0 0 0 4px color-mix(in srgb,var(--stop) 18%,transparent); }
+  .state{ font-size:20px; font-weight:650; letter-spacing:-.2px; }
+  .statesub{ font-size:12.5px; color:var(--muted); margin-top:1px; }
+
+  .toggle{ width:100%; font:inherit; font-weight:600; font-size:15px; padding:13px;
+           border-radius:12px; cursor:pointer; border:1px solid var(--line);
+           background:var(--hover); color:var(--fg); transition:transform .05s, filter .15s; }
+  .toggle:hover{ filter:brightness(1.06); }
+  .toggle:active{ transform:scale(.985); }
+  .toggle.resume{ background:var(--ok); border-color:var(--ok); color:#042a1c; }
+  .chips{ display:flex; gap:8px; margin-top:10px; }
+  .chips button{ flex:1; font:inherit; font-size:12.5px; font-weight:550; color:var(--muted);
+                 padding:8px; border-radius:9px; cursor:pointer; background:transparent;
+                 border:1px solid var(--line); transition:background .15s, color .15s; }
+  .chips button:hover{ background:var(--hover); color:var(--fg); }
+
+  .rule{ display:flex; align-items:center; gap:10px; margin:20px 0 6px; }
+  .rule span{ font-size:11px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; color:var(--faint); }
+  .rule:before,.rule:after{ content:""; height:1px; background:var(--line); flex:1; }
+  .rule:before{ flex:0 0 0; }
+
+  .hist{ list-style:none; margin:0; padding:0; max-height:340px; overflow-y:auto; }
+  .hist::-webkit-scrollbar{ width:8px; }
+  .hist::-webkit-scrollbar-thumb{ background:var(--line); border-radius:8px; }
+  .hitem{ display:grid; grid-template-columns:auto 1fr auto; align-items:baseline; gap:10px;
+          padding:9px 2px; border-bottom:1px solid var(--line); }
+  .hitem:last-child{ border-bottom:0; }
+  .hic{ font-size:12px; line-height:1.2; opacity:.9; }
+  .hbody{ min-width:0; }
+  .htext{ font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .k-mute .htext,.k-drop .htext{ color:var(--muted); }
+  .hmeta{ font-size:11px; color:var(--faint); margin-top:1px; }
+  .htime{ font-size:11px; color:var(--faint); white-space:nowrap; }
+  .empty{ text-align:center; color:var(--faint); font-size:12.5px; padding:22px 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <header>
+      <span class="brand">speak when done</span>
+      <span class="qd" id="qd"></span>
+    </header>
+
+    <div class="hero">
+      <span class="dot" id="dot"></span>
+      <div>
+        <div class="state" id="state">…</div>
+        <div class="statesub" id="statesub"></div>
+      </div>
+    </div>
+
+    <button class="toggle" id="toggle" onclick="toggleMute()"></button>
+    <div class="chips" id="chips">
+      <button onclick="pause(15)">15 min</button>
+      <button onclick="pause(30)">30 min</button>
+      <button onclick="pause(60)">1 hour</button>
+    </div>
+
+    <div class="rule"><span>Recent</span></div>
+    <ul class="hist" id="hist"></ul>
+  </div>
+<script>
+  let cur = {};
+  const KIND = { spoken:'\\u{1F50A}', suppressed:'\\u{1F507}', dropped:'\\u23F1' };
+
+  function ago(iso){
+    const t = Date.parse(iso||''); if(isNaN(t)) return '';
+    let s = Math.max(0,(Date.now()-t)/1000);
+    if(s<45) return 'just now';
+    const m=s/60; if(m<60) return Math.round(Math.max(1,m))+'m';
+    const h=m/60; if(h<24) return Math.round(h)+'h';
+    return Math.round(h/24)+'d';
+  }
+  function label(it){
+    if(it.kind==='suppressed') return it.reason==='paused' ? 'muted' : 'mic';
+    if(it.kind==='dropped') return 'stale';
+    return '';
+  }
+  function renderHist(items){
+    const ul = document.getElementById('hist'); ul.innerHTML='';
+    if(!items || !items.length){
+      const li=document.createElement('li'); li.className='empty';
+      li.textContent='No notifications yet.'; ul.appendChild(li); return;
+    }
+    for(const it of items){
+      const li=document.createElement('li'); li.className='hitem k-'+it.kind.slice(0,4);
+      const ic=document.createElement('span'); ic.className='hic'; ic.textContent=KIND[it.kind]||KIND.spoken;
+      const body=document.createElement('div'); body.className='hbody';
+      const txt=document.createElement('div'); txt.className='htext';
+      txt.textContent = it.text || (it.chars ? '('+it.chars+' chars)' : '(no text logged)');
+      if(it.text){ li.title = it.text; }
+      body.appendChild(txt);
+      const bits=[]; const l=label(it);
+      if(l) bits.push(l);
+      if(it.persona) bits.push(it.persona);      // persona is optional
+      if(bits.length){ const m=document.createElement('div'); m.className='hmeta';
+        m.textContent=bits.join(' \\u00B7 '); body.appendChild(m); }
+      const tm=document.createElement('span'); tm.className='htime'; tm.textContent=ago(it.ts);
+      li.appendChild(ic); li.appendChild(body); li.appendChild(tm);
+      ul.appendChild(li);
+    }
+  }
+  async function refresh(){
+    try{
+      const s = await (await fetch('/status',{cache:'no-store'})).json();
+      cur = s;
+      document.body.className = s.paused ? 'is-mute' : (s.mic_active ? 'is-mic' : 'is-on');
+      const st=document.getElementById('state'), sub=document.getElementById('statesub');
+      const tg=document.getElementById('toggle'), chips=document.getElementById('chips');
+      if(s.paused){
+        st.textContent='Muted';
+        sub.textContent = s.seconds_left==null ? 'until you resume'
+          : Math.ceil(s.seconds_left/60)+' min left \\u00B7 resumes '+(s.until_iso||'');
+        tg.textContent='Resume speaking'; tg.className='toggle resume'; chips.style.display='none';
+      } else if(s.mic_active){
+        st.textContent='Quiet'; sub.textContent='mic in use \\u2014 auto-paused';
+        tg.textContent='Mute anyway'; tg.className='toggle'; chips.style.display='flex';
+      } else {
+        st.textContent='On'; sub.textContent='notifications will play';
+        tg.textContent='Mute'; tg.className='toggle'; chips.style.display='flex';
+      }
+      document.getElementById('qd').textContent = s.queue_depth ? (s.queue_depth+' queued') : '';
+      renderHist(s.recent);
+    }catch(e){ document.getElementById('state').textContent='daemon unreachable'; }
+  }
+  function toggleMute(){ cur.paused ? resume() : pause(0); }
+  async function pause(min){ await fetch('/pause?minutes='+min,{method:'POST'}); refresh(); }
+  async function resume(){ await fetch('/resume',{method:'POST'}); refresh(); }
+  refresh(); setInterval(refresh, 4000);
+</script>
+</body>
+</html>
+"""
+
+
+class _ControlHandler(http.server.BaseHTTPRequestHandler):
+    # Quiet the default per-request stderr spam; route to the daemon logger.
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        logger.debug("control %s - %s", self.address_string(), format % args)
+
+    def _send(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(body)
+
+    def _send_json(self, obj: dict) -> None:
+        self._send(200, json.dumps(obj).encode(), "application/json")
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/" or path == "/index.html":
+            self._send(200, _CONTROL_HTML.encode(), "text/html; charset=utf-8")
+        elif path == "/status":
+            self._send_json(_status_dict())
+        elif path == "/history":
+            self._send_json({"recent": _recent_speaks()})
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+        if path == "/pause":
+            minutes = 0.0
+            with contextlib.suppress(ValueError, IndexError):
+                minutes = float(params.get("minutes", ["0"])[0])
+            duration_s = minutes * 60 if minutes > 0 else None
+            state = swd.set_pause(True, duration_s=duration_s, reason="control-ui")
+            logger.info(
+                "paused via control UI (%s)",
+                f"{minutes:.0f} min" if duration_s else "until resumed",
+            )
+            self._send_json({**_status_dict(), **{"ok": True, "state": state}})
+        elif path == "/resume":
+            swd.set_pause(False)
+            logger.info("resumed via control UI")
+            self._send_json({**_status_dict(), "ok": True})
+        else:
+            self._send(404, b"not found", "text/plain")
+
+
+def _start_control_server() -> None:
+    """Serve the pause UI + control API in a background daemon thread."""
+    try:
+        httpd = http.server.ThreadingHTTPServer(
+            (CONTROL_HOST, CONTROL_PORT), _ControlHandler
+        )
+    except OSError as e:
+        logger.warning(
+            "control server not started (port %d unavailable): %s", CONTROL_PORT, e
+        )
+        return
+    thread = threading.Thread(
+        target=httpd.serve_forever, name="speak-control", daemon=True
+    )
+    thread.start()
+    logger.info(
+        "control UI at http://%s:%d/ (pause/resume notifications)",
+        CONTROL_HOST,
+        CONTROL_PORT,
+    )
 
 
 # ---- MCP surface (streamable HTTP) -----------------------------------------
@@ -378,7 +741,8 @@ def speak(message: str, cwd: str | None = None, voice: str | None = None) -> dic
     if result.get("success"):
         logger.info(
             "queued at position %s (persona=%s)",
-            result.get("position"), result.get("persona"),
+            result.get("position"),
+            result.get("persona"),
         )
     else:
         logger.error("enqueue failed: %s", result.get("error"))
@@ -429,10 +793,16 @@ def _preload() -> None:
 def main() -> None:
     _preload()
     _start_worker()
+    _start_control_server()
     logger.info(
         "speak_when_done daemon serving MCP at http://%s:%d/mcp "
         "(queue_max=%d, stale_after=%.0fs, keep_warm_idle=%.0fs, watchdog=%.0fs)",
-        HOST, PORT, QUEUE_MAX, STALE_AFTER_S, KEEP_WARM_IDLE_S, SYNTH_WATCHDOG_S,
+        HOST,
+        PORT,
+        QUEUE_MAX,
+        STALE_AFTER_S,
+        KEEP_WARM_IDLE_S,
+        SYNTH_WATCHDOG_S,
     )
     mcp.run(transport="streamable-http")
 

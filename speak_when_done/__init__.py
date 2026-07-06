@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 __version__ = "0.1.0"
 
@@ -80,13 +81,76 @@ def _is_builtin_voice(voice: str) -> bool:
     return voice in _BUILTIN_VOICE_NAMES
 
 
+# When True, is_microphone_active() runs the CoreAudio query in a fresh
+# subprocess instead of in-process.
+#
+# WHY: a long-lived process that queries CoreAudio device properties but never
+# runs a CoreAudio run loop accumulates a STALE HAL cache — it misses some mic
+# on/off transitions and reports the wrong state. The shared daemon (running for
+# days) spoke over a live meeting on 2026-07-05 for exactly this reason: the
+# per-notification fresh process the pre-2026-07-02 design used always read the
+# mic correctly; the resident daemon that replaced it does not. A brand-new
+# process builds a fresh HAL client, so its reading is always current.
+#
+# The daemon sets this True at import; short-lived CLI/library callers leave it
+# False — they are already fresh, so the extra subprocess would only add latency.
+MIC_CHECK_FRESH = False
+
+
 def is_microphone_active() -> bool:
     """
     Check if any microphone is currently in use on macOS.
 
-    Uses CoreAudio API to query all audio input devices.
-    Returns False on non-macOS platforms.
+    Uses CoreAudio API to query all audio input devices. Returns False on
+    non-macOS platforms. When MIC_CHECK_FRESH is set, delegates to a fresh
+    subprocess to dodge the stale-HAL-cache bug documented on that flag.
     """
+    if sys.platform != "darwin":
+        return False
+    if MIC_CHECK_FRESH:
+        fresh = _microphone_active_subprocess()
+        if fresh is not None:
+            return fresh
+        # Subprocess failed for some reason — fall back to the in-process query
+        # rather than silently un-suppressing (returning a hard False).
+    return _microphone_active_native()
+
+
+def _microphone_active_subprocess() -> bool | None:
+    """Run the CoreAudio mic query in a fresh interpreter; None on failure.
+
+    A brand-new process has no stale HAL cache, so its reading is always
+    current. Reuses _microphone_active_native() (single source of truth for the
+    CoreAudio logic) and sets SPEAK_WHEN_DONE_NO_CWD_DISCOVERY so the re-import
+    skips the process-tree walk. Returns None (not False) on any failure so the
+    caller can fall back rather than treating a crash as "mic is off".
+    """
+    env = {**os.environ, "SPEAK_WHEN_DONE_NO_CWD_DISCOVERY": "1"}
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import speak_when_done as s; "
+                "print(1 if s._microphone_active_native() else 0)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    out = proc.stdout.strip()
+    if proc.returncode != 0 or out not in ("0", "1"):
+        return None
+    return out == "1"
+
+
+def _microphone_active_native() -> bool:
+    """CoreAudio query in the CURRENT process (may be stale in a long-lived
+    daemon — see MIC_CHECK_FRESH)."""
     if sys.platform != "darwin":
         return False
 
@@ -105,10 +169,10 @@ def is_microphone_active() -> bool:
         ]
 
     AUDIO_OBJECT_SYSTEM_OBJECT = 1
-    SCOPE_GLOBAL = 0x676C6F62   # 'glob'
-    SCOPE_INPUT = 0x696E7074    # 'inpt'
-    PROP_DEVICES = 0x64657623   # 'dev#'
-    PROP_STREAMS = 0x73746D23   # 'stm#'
+    SCOPE_GLOBAL = 0x676C6F62  # 'glob'
+    SCOPE_INPUT = 0x696E7074  # 'inpt'
+    PROP_DEVICES = 0x64657623  # 'dev#'
+    PROP_STREAMS = 0x73746D23  # 'stm#'
     PROP_RUNNING_SOMEWHERE = 0x676F6E65  # 'gone'
 
     # Get all audio device IDs
@@ -147,9 +211,7 @@ def is_microphone_active() -> bool:
             continue
 
         # Is any process using this input device?
-        run_addr = AudioObjectPropertyAddress(
-            PROP_RUNNING_SOMEWHERE, SCOPE_GLOBAL, 0
-        )
+        run_addr = AudioObjectPropertyAddress(PROP_RUNNING_SOMEWHERE, SCOPE_GLOBAL, 0)
         is_running = ctypes.c_uint32(0)
         run_size = ctypes.c_uint32(4)
         err = ca.AudioObjectGetPropertyData(
@@ -182,13 +244,18 @@ def _get_audio_player() -> list[str] | None:
     elif platform == "win32":
         # Windows: use PowerShell with -File or script block
         # Path is passed as a separate argument to avoid injection
-        return ["powershell", "-NoProfile", "-Command",
-                "[System.Media.SoundPlayer]::new($args[0]).PlaySync()", "-args"]
+        return [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "[System.Media.SoundPlayer]::new($args[0]).PlaySync()",
+            "-args",
+        ]
     else:
         # Linux/BSD: try common audio players in order of preference
         linux_players = [
-            ["paplay"],      # PulseAudio (most common on modern Linux)
-            ["aplay"],       # ALSA (fallback)
+            ["paplay"],  # PulseAudio (most common on modern Linux)
+            ["aplay"],  # ALSA (fallback)
             ["ffplay", "-nodisp", "-autoexit"],  # FFmpeg (if installed)
         ]
         for player in linux_players:
@@ -264,9 +331,18 @@ def _get_cached_voice(voice_path: str) -> str:
             return str(cached)
 
         # Export voice to safetensors atomically (temp file then rename)
-        tmp_cached = VOICE_CACHE_DIR / f".tmp_{stem}_{source_hash}_{os.getpid()}.safetensors"
+        tmp_cached = (
+            VOICE_CACHE_DIR / f".tmp_{stem}_{source_hash}_{os.getpid()}.safetensors"
+        )
         result = subprocess.run(
-            ["uvx", _POCKET_TTS_SPEC, "export-voice", voice_path, str(tmp_cached), "--quiet"],
+            [
+                "uvx",
+                _POCKET_TTS_SPEC,
+                "export-voice",
+                voice_path,
+                str(tmp_cached),
+                "--quiet",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
@@ -455,6 +531,72 @@ def _log_event(event: str, *, drift: list[str] | None = None, **fields) -> None:
         pass
 
 
+# ---- Pause / mute state -----------------------------------------------------
+# A file-backed pause switch so speech can be silenced ON DEMAND — independent
+# of the meeting/microphone check. The control UI (daemon) writes it; speak()
+# reads it at playback time. File-backed (not in-memory) so any process — the
+# daemon worker, the CLI, a curl to the control server — sees the same state.
+_STATE_DIR = os.environ.get("SPEAK_WHEN_DONE_STATE_DIR") or os.path.join(
+    os.path.dirname(_PERSONA_DIR), "state"
+)
+_PAUSE_FILE = os.path.join(_STATE_DIR, "pause.json")
+
+
+def get_pause_state() -> dict:
+    """Return the current pause state, honoring expiry.
+
+    Shape: {"paused": bool, "until": float | None, "reason": str | None}.
+    A pause whose "until" epoch has passed reads as not paused (auto-resume),
+    so "pause for 30 minutes" needs no timer. Never raises.
+    """
+    not_paused = {"paused": False, "until": None, "reason": None}
+    try:
+        with open(_PAUSE_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return not_paused
+    if not data.get("paused"):
+        return not_paused
+    until = data.get("until")
+    if until is not None:
+        try:
+            if time.time() >= float(until):
+                return not_paused
+        except (TypeError, ValueError):
+            until = None
+    return {"paused": True, "until": until, "reason": data.get("reason")}
+
+
+def is_paused() -> bool:
+    """True if speech is currently paused on demand (expiry-aware)."""
+    return get_pause_state()["paused"]
+
+
+def set_pause(
+    paused: bool,
+    *,
+    duration_s: float | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Persist the pause switch. ``duration_s`` sets an auto-resume horizon
+    (None = pause until explicitly resumed). Returns the resulting state."""
+    if paused:
+        until = time.time() + duration_s if duration_s else None
+        data = {"paused": True, "until": until, "reason": reason}
+    else:
+        data = {"paused": False, "until": None, "reason": None}
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _PAUSE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _PAUSE_FILE)
+    except OSError:
+        pass
+    _log_event("pause_set", paused=paused, until=data.get("until"), reason=reason)
+    return get_pause_state()
+
+
 def _check_drift(persona: str, voice: str, playbooks: dict[str, str]) -> list[str]:
     """Return human-readable drift issues; empty list when clean.
 
@@ -487,7 +629,9 @@ def _check_drift(persona: str, voice: str, playbooks: dict[str, str]) -> list[st
 
     section = playbooks.get(persona, "")
     if not section:
-        issues.append(f"no persona file at {os.path.join(_PERSONA_DIR, persona + '.md')}")
+        issues.append(
+            f"no persona file at {os.path.join(_PERSONA_DIR, persona + '.md')}"
+        )
     else:
         first_line = section.split("\n", 1)[0]
         if not first_line.lower().startswith(f"## {persona} "):
@@ -630,7 +774,9 @@ def _discover_caller_cwd() -> str | None:
         try:
             r = subprocess.run(
                 ["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
-                capture_output=True, text=True, timeout=2,
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             cwd = None
             for line in r.stdout.splitlines():
@@ -641,7 +787,9 @@ def _discover_caller_cwd() -> str | None:
                 return cwd
             pr = subprocess.run(
                 ["ps", "-o", "ppid=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=2,
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             pid = int(pr.stdout.strip() or 0) or None
         except Exception:
@@ -692,7 +840,15 @@ def _resolve_active_persona_and_voice(cwd: str | None = None) -> tuple[str, str]
 # Module-level snapshot taken at import time. ``list_voices()`` and ``speak()``
 # both re-resolve at call time, so changing persona files / env vars at runtime is
 # picked up without a restart.
-ACTIVE_WORKTREE = _discover_caller_cwd()
+# The fresh-subprocess mic check (see MIC_CHECK_FRESH) re-imports this module
+# only to call _microphone_active_native(); it sets this env var so import skips
+# the process-tree walk in _discover_caller_cwd() (a few hundred ms + a
+# cwd_discovery_failed log event we don't want on every playback).
+ACTIVE_WORKTREE = (
+    None
+    if os.environ.get("SPEAK_WHEN_DONE_NO_CWD_DISCOVERY")
+    else _discover_caller_cwd()
+)
 ACTIVE_PERSONA, DEFAULT_VOICE = _resolve_active_persona_and_voice(ACTIVE_WORKTREE)
 
 
@@ -721,13 +877,15 @@ def list_voices(cwd: str | None = None) -> dict:
             style = playbooks[name]
         else:
             style = cfg.get("tagline", f"(see {_PERSONA_DIR}/{name}.md)")
-        persona_voices.append({
-            "name": name,
-            "style": style,
-            "path": cfg["path"],
-            "speed": cfg.get("speed", 1.0),
-            "language": cfg.get("language", DEFAULT_LANGUAGE),
-        })
+        persona_voices.append(
+            {
+                "name": name,
+                "style": style,
+                "path": cfg["path"],
+                "speed": cfg.get("speed", 1.0),
+                "language": cfg.get("language", DEFAULT_LANGUAGE),
+            }
+        )
 
     active_style_parts = []
     common_path = os.path.join(_PERSONA_DIR, "_common.md")
@@ -736,7 +894,9 @@ def list_voices(cwd: str | None = None) -> dict:
             active_style_parts.append(f.read().rstrip())
     except OSError:
         pass
-    persona_style = playbooks.get(persona) or PERSONA_VOICES.get(persona, {}).get("tagline")
+    persona_style = playbooks.get(persona) or PERSONA_VOICES.get(persona, {}).get(
+        "tagline"
+    )
     if persona_style:
         active_style_parts.append(persona_style)
     active_style = "\n\n".join(active_style_parts) if active_style_parts else None
@@ -787,9 +947,15 @@ _PLAYBACK_LOCK_PATH = os.path.expanduser("~/.claude/speak_when_done.lock")
 _GENERATOR = None
 
 
-def speak(message: str, voice: str | None = None, quiet: bool = False,
-          suppress_in_meeting: bool = True, speed: float | None = None,
-          warmup: str = "", cwd: str | None = None) -> dict:
+def speak(
+    message: str,
+    voice: str | None = None,
+    quiet: bool = False,
+    suppress_in_meeting: bool = True,
+    speed: float | None = None,
+    warmup: str = "",
+    cwd: str | None = None,
+) -> dict:
     """
     Speak a message aloud using Pocket TTS.
 
@@ -828,8 +994,30 @@ def speak(message: str, voice: str | None = None, quiet: bool = False,
     else:
         voice = default_voice
 
+    # On-demand pause takes precedence over (and is independent of) the meeting
+    # check — this is how the user silences notifications when NOT in a meeting.
+    if is_paused():
+        _log_event(
+            "speak_suppressed",
+            reason="paused",
+            persona=persona,
+            voice=voice,
+            text=message,
+        )
+        return {
+            "success": False,
+            "suppressed": True,
+            "reason": "paused",
+        }
+
     if suppress_in_meeting and sys.platform == "darwin" and is_microphone_active():
-        _log_event("speak_suppressed", reason="microphone in use", persona=persona, voice=voice)
+        _log_event(
+            "speak_suppressed",
+            reason="microphone in use",
+            persona=persona,
+            voice=voice,
+            text=message,
+        )
         return {
             "success": False,
             "suppressed": True,
@@ -841,8 +1029,8 @@ def speak(message: str, voice: str | None = None, quiet: bool = False,
         return {
             "success": False,
             "error": f"No audio player found for platform '{sys.platform}'. "
-                     "Install one of: afplay (macOS), paplay/aplay (Linux), "
-                     "or ensure PowerShell is available (Windows).",
+            "Install one of: afplay (macOS), paplay/aplay (Linux), "
+            "or ensure PowerShell is available (Windows).",
         }
 
     output_path = None
@@ -855,7 +1043,11 @@ def speak(message: str, voice: str | None = None, quiet: bool = False,
         # Only apply the persona's language/speed overrides when actually
         # playing the persona's own voice (not a caller-picked builtin voice).
         is_persona_voice = persona_cfg.get("path") == voice
-        language = persona_cfg.get("language", DEFAULT_LANGUAGE) if is_persona_voice else DEFAULT_LANGUAGE
+        language = (
+            persona_cfg.get("language", DEFAULT_LANGUAGE)
+            if is_persona_voice
+            else DEFAULT_LANGUAGE
+        )
 
         # Prepend warmup text if provided (voice-cloning warmup)
         tts_text = f"{warmup} {message}" if warmup else message
@@ -877,15 +1069,23 @@ def speak(message: str, voice: str | None = None, quiet: bool = False,
                 }
         else:
             cmd = [
-                "uvx", _POCKET_TTS_SPEC, "generate",
-                "--text", tts_text,
-                "--voice", resolved_voice,
-                "--language", language,
+                "uvx",
+                _POCKET_TTS_SPEC,
+                "generate",
+                "--text",
+                tts_text,
+                "--voice",
+                resolved_voice,
+                "--language",
+                language,
                 # Tighter EOS detection + no trailing frames prevents the "trails off
                 # weirdly" artifact at sentence end.
-                "--eos-threshold", "-2",
-                "--frames-after-eos", "0",
-                "--output-path", output_path,
+                "--eos-threshold",
+                "-2",
+                "--frames-after-eos",
+                "0",
+                "--output-path",
+                output_path,
             ]
             if quiet:
                 cmd.append("--quiet")
@@ -939,6 +1139,7 @@ def speak(message: str, voice: str | None = None, quiet: bool = False,
                 prompt_sha=prompt_sha,
                 voice_sha=voice_sha,
                 message_chars=len(message),
+                text=message,
                 drift=drift or None,
             )
             return {

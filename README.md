@@ -328,9 +328,37 @@ stretch, cross-session playback lock, and drift logging unchanged — it only
 swaps the synthesis backend (via the `_GENERATOR` hook) from a cold
 `uvx pocket-tts` subprocess to the resident model.
 
+### Pause / mute — browser control panel
+
+The daemon also serves a small control page on its own port
+(`SPEAK_WHEN_DONE_CONTROL_PORT`, default **9877** — separate from the MCP
+endpoint). Open `http://127.0.0.1:9877/` to silence notifications **on demand**,
+even when you're not in a meeting: one button mutes until you resume, three chips
+mute for 15 / 30 / 60 minutes. It shows live status (On · Quiet — mic in use ·
+Muted) plus the queue depth, and a **Recent** feed of the last notifications —
+each with its text, relative time, outcome (spoken · muted · mic · stale), and
+persona when one is set (persona is optional). Pause state is file-backed
+(`state/pause.json`, override with `SPEAK_WHEN_DONE_STATE_DIR`), so the worker's
+playback-time check and the UI always agree; timed pauses auto-resume (expiry is
+evaluated on read, no timer needed).
+
+```bash
+curl -sX POST 'http://127.0.0.1:9877/pause?minutes=30'   # quiet 30 min
+curl -sX POST  http://127.0.0.1:9877/resume              # resume now
+curl -s        http://127.0.0.1:9877/status              # JSON status + recent history
+curl -s        http://127.0.0.1:9877/history             # just the recent-speaks feed
+```
+
 ## Meeting suppression
 
 On macOS, speech is automatically suppressed when a microphone is active (e.g. during a video call). Override with `--ignore-meeting`.
+
+**In the daemon the mic check runs in a fresh subprocess** (`MIC_CHECK_FRESH`).
+A long-lived process that queries CoreAudio but never runs a CoreAudio run loop
+accumulates a stale HAL cache — it misses some mic on/off transitions and can
+speak over a live meeting. A throwaway subprocess builds a fresh HAL client and
+always reads the current state (~0.1 s per playback). Short-lived CLI/library
+callers leave the flag off — they're already fresh.
 
 ## Built on pocket-tts
 
