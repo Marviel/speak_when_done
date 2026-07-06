@@ -35,6 +35,8 @@ import json
 import logging
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -381,6 +383,49 @@ _HISTORY_KINDS = {
     "speak_dropped_stale": "dropped",
 }
 
+# Optional worktree-title resolution: the history logs the worktree *path*, but
+# the UI can show the human TBD title ("🔇 Fix Speak Mic…") instead. Resolved via
+# `tbd worktree list --json`, cached (titles rarely change), best-effort — if tbd
+# is missing or fails, titles are simply absent and the feature no-ops. launchd's
+# minimal PATH omits ~/.local/bin, so probe an explicit path too.
+_TBD_BIN = shutil.which("tbd") or os.path.expanduser("~/.local/bin/tbd")
+_TBD_CACHE_TTL_S = 15.0
+_tbd_cache_map: dict[str, str] = {}
+_tbd_cache_at: float = 0.0
+
+
+def _tbd_titles() -> dict[str, str]:
+    """{worktree_path: display title} from TBD, cached ~15s; {} if unavailable.
+
+    The daemon already knows each speak's worktree PATH (callers pass it as
+    `cwd`), so it resolves the human title itself — no worker or MCP-registration
+    change is needed. Best-effort: last-good map is kept on any failure.
+    """
+    global _tbd_cache_map, _tbd_cache_at
+    now = time.monotonic()
+    if now - _tbd_cache_at < _TBD_CACHE_TTL_S:
+        return _tbd_cache_map
+    result = _tbd_cache_map  # fall back to last-good on any failure below
+    try:
+        proc = subprocess.run(
+            [_TBD_BIN, "worktree", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            result = {}
+            for wt in json.loads(proc.stdout):
+                p = (wt.get("path") or "").rstrip("/")
+                title = wt.get("displayName") or wt.get("name")
+                if p and title:
+                    result[p] = title
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    _tbd_cache_map = result
+    _tbd_cache_at = now
+    return result
+
 
 def _recent_speaks(limit: int = 40) -> list[dict]:
     """Recent speak-related events, newest first, from the tail of the call log.
@@ -402,6 +447,7 @@ def _recent_speaks(limit: int = 40) -> list[dict]:
     lines = chunk.splitlines()
     if back < size and lines:
         lines = lines[1:]  # drop the partial first line from a mid-file seek
+    titles = _tbd_titles()  # {path: title}, cached + best-effort
     out: list[dict] = []
     for line in reversed(lines):
         if len(out) >= limit:
@@ -423,6 +469,9 @@ def _recent_speaks(limit: int = 40) -> list[dict]:
                 "text": r.get("text"),
                 "chars": r.get("message_chars"),
                 "worktree": os.path.basename(wt) if wt else None,
+                # Human TBD title for the worktree, when resolvable — the UI
+                # shows it only if the user enables "Show worktree names".
+                "worktree_title": titles.get(wt) if wt else None,
             }
         )
     return out
@@ -508,6 +557,11 @@ _CONTROL_HTML = """<!doctype html>
                  border:1px solid var(--line); transition:background .15s, color .15s; }
   .chips button:hover{ background:var(--hover); color:var(--fg); }
 
+  /* "Show worktree names" toggle, pinned to the bottom of the controls pane. */
+  .opt{ margin-top:auto; padding-top:22px; display:flex; align-items:center; gap:9px;
+        font-size:12.5px; color:var(--muted); cursor:pointer; user-select:none; }
+  .opt input{ accent-color:var(--accent); width:15px; height:15px; cursor:pointer; margin:0; }
+
   .feed{ display:flex; flex-direction:column; min-height:0; padding:30px 14px 10px 30px; }
   .rule{ display:flex; align-items:center; gap:12px; margin:0 16px 4px 0; }
   .rule span{ font-size:11.5px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; color:var(--faint); }
@@ -516,15 +570,26 @@ _CONTROL_HTML = """<!doctype html>
   .hist{ list-style:none; margin:0; padding:0 16px 0 0; flex:1; overflow-y:auto; }
   .hist::-webkit-scrollbar{ width:9px; }
   .hist::-webkit-scrollbar-thumb{ background:var(--line); border-radius:8px; }
-  .hitem{ display:grid; grid-template-columns:auto 1fr auto; align-items:baseline; gap:13px;
-          padding:12px 2px; border-bottom:1px solid var(--line); }
+  .hitem{ display:grid; grid-template-columns:auto 1fr auto; align-items:start; gap:13px;
+          padding:12px 8px; margin-right:-6px; border-bottom:1px solid var(--line);
+          border-radius:8px; }
   .hitem:last-child{ border-bottom:0; }
-  .hic{ font-size:14px; line-height:1.2; opacity:.9; }
+  .hitem.long{ cursor:pointer; }
+  .hitem.long:hover{ background:var(--hover); }
+  .hic{ font-size:14px; line-height:1.5; opacity:.9; }
   .hbody{ min-width:0; }
-  .htext{ font-size:14.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* Messages wrap and show in full; only a genuinely long one is clamped to 3
+     lines (with a caret) and expands on click. Most are one line — nothing cut. */
+  .htext{ font-size:14.5px; word-break:break-word;
+          display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
+  .hitem.expanded .htext{ -webkit-line-clamp:unset; }
+  .hitem.long .htext{ position:relative; }
+  .hitem.long .htext::after{ content:" ▾"; color:var(--faint); font-size:12px; }
+  .hitem.long.expanded .htext::after{ content:" ▴"; }
   .k-mute .htext,.k-drop .htext{ color:var(--muted); }
-  .hmeta{ font-size:12px; color:var(--faint); margin-top:2px; }
-  .htime{ font-size:12px; color:var(--faint); white-space:nowrap; }
+  .hmeta{ font-size:12px; color:var(--faint); margin-top:3px; }
+  .hwt{ font-size:12px; color:var(--muted); font-weight:500; margin-top:2px; }
+  .htime{ font-size:12px; color:var(--faint); white-space:nowrap; line-height:1.5; }
   .empty{ text-align:center; color:var(--faint); font-size:13px; padding:34px 0; }
 
   @media (max-width:720px){
@@ -533,6 +598,7 @@ _CONTROL_HTML = """<!doctype html>
     .controls{ border-right:0; border-bottom:1px solid var(--line); padding:24px; }
     header{ margin-bottom:20px; }
     .hero{ margin-bottom:18px; }
+    .opt{ margin-top:20px; padding-top:0; }
     .state{ font-size:23px; }
     .feed{ padding:22px 8px 8px 22px; }
     .hist{ max-height:48vh; }
@@ -561,6 +627,8 @@ _CONTROL_HTML = """<!doctype html>
         <button onclick="pause(30)">30 min</button>
         <button onclick="pause(60)">1 hour</button>
       </div>
+
+      <label class="opt"><input type="checkbox" id="wtToggle"> Show worktree names</label>
     </aside>
 
     <section class="feed">
@@ -585,28 +653,45 @@ _CONTROL_HTML = """<!doctype html>
     if(it.kind==='dropped') return 'stale';
     return '';
   }
+  const wtToggle = document.getElementById('wtToggle');
+  const expanded = new Set();   // row keys the user has expanded — survive refreshes
+  let lastHistKey = '';         // skip re-rendering the feed when nothing changed
+
   function renderHist(items){
     const ul = document.getElementById('hist'); ul.innerHTML='';
     if(!items || !items.length){
       const li=document.createElement('li'); li.className='empty';
       li.textContent='No notifications yet.'; ul.appendChild(li); return;
     }
+    const showWt = wtToggle.checked;
     for(const it of items){
+      const key = (it.ts||'') + '|' + (it.text||'');
       const li=document.createElement('li'); li.className='hitem k-'+it.kind.slice(0,4);
       const ic=document.createElement('span'); ic.className='hic'; ic.textContent=KIND[it.kind]||KIND.spoken;
       const body=document.createElement('div'); body.className='hbody';
       const txt=document.createElement('div'); txt.className='htext';
       txt.textContent = it.text || (it.chars ? '('+it.chars+' chars)' : '(no text logged)');
-      if(it.text){ li.title = it.text; }
       body.appendChild(txt);
       const bits=[]; const l=label(it);
       if(l) bits.push(l);
       if(it.persona) bits.push(it.persona);      // persona is optional
       if(bits.length){ const m=document.createElement('div'); m.className='hmeta';
         m.textContent=bits.join(' \\u00B7 '); body.appendChild(m); }
+      if(showWt && it.worktree_title){ const w=document.createElement('div'); w.className='hwt';
+        w.textContent=it.worktree_title; body.appendChild(w); }
       const tm=document.createElement('span'); tm.className='htime'; tm.textContent=ago(it.ts);
       li.appendChild(ic); li.appendChild(body); li.appendChild(tm);
       ul.appendChild(li);
+      // Only rows whose text actually overflows the 3-line clamp become
+      // click-to-expand (measured now that the element is laid out).
+      if(expanded.has(key)) li.classList.add('expanded');
+      if(txt.scrollHeight > txt.clientHeight + 1 || expanded.has(key)){
+        li.classList.add('long');
+        li.addEventListener('click', () => {
+          if(expanded.has(key)){ expanded.delete(key); li.classList.remove('expanded'); }
+          else { expanded.add(key); li.classList.add('expanded'); }
+        });
+      }
     }
   }
   async function refresh(){
@@ -629,9 +714,18 @@ _CONTROL_HTML = """<!doctype html>
         tg.textContent='Mute'; tg.className='toggle'; chips.style.display='flex';
       }
       document.getElementById('qd').textContent = s.queue_depth ? (s.queue_depth+' queued') : '';
-      renderHist(s.recent);
+      // Rebuild the feed only when its data (or the toggle) changed — otherwise
+      // the 4s poll would reset scroll position and collapse expanded rows.
+      const hk = JSON.stringify((s.recent||[]).map(r=>[r.ts,r.kind,r.reason,r.worktree_title]))
+                 + '|' + wtToggle.checked;
+      if(hk !== lastHistKey){ lastHistKey = hk; renderHist(s.recent); }
     }catch(e){ document.getElementById('state').textContent='daemon unreachable'; }
   }
+  wtToggle.checked = localStorage.getItem('swd_show_worktree')==='1';
+  wtToggle.addEventListener('change', ()=>{
+    localStorage.setItem('swd_show_worktree', wtToggle.checked?'1':'0');
+    lastHistKey=''; if(cur.recent) renderHist(cur.recent);
+  });
   function toggleMute(){ cur.paused ? resume() : pause(0); }
   async function pause(min){ await fetch('/pause?minutes='+min,{method:'POST'}); refresh(); }
   async function resume(){ await fetch('/resume',{method:'POST'}); refresh(); }
