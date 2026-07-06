@@ -471,80 +471,102 @@ _CONTROL_HTML = """<!doctype html>
     --faint:#9aa2ae; --line:#e6e9ef; --hover:#f5f7fa; --accent:#3b6bff; color-scheme:light; }
   *{ box-sizing:border-box; }
   body{ margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
-        font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
-        display:flex; align-items:flex-start; justify-content:center; padding:28px 16px;
+        font:14.5px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+        display:flex; align-items:center; justify-content:center; padding:4vh 4vw;
         -webkit-font-smoothing:antialiased; }
-  .card{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
-         border-radius:20px; padding:22px; box-shadow:0 10px 40px rgba(0,0,0,.18); }
-  header{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
-  .brand{ font-size:13px; font-weight:600; letter-spacing:.3px; color:var(--muted); }
-  .qd{ font-size:11px; color:var(--faint); }
+  /* Desktop: a wide two-pane card — controls on the left, a tall history feed
+     on the right. Collapses to a single narrow column on real phones. */
+  .card{ width:100%; max-width:1000px; height:min(82vh,760px); background:var(--card);
+         border:1px solid var(--line); border-radius:22px; overflow:hidden;
+         box-shadow:0 18px 60px rgba(0,0,0,.20);
+         display:grid; grid-template-columns:340px 1fr; }
 
-  .hero{ display:flex; align-items:center; gap:13px; margin-bottom:18px; }
-  .dot{ width:12px; height:12px; border-radius:50%; flex:0 0 auto; background:var(--faint);
+  .controls{ padding:32px 30px; display:flex; flex-direction:column;
+             border-right:1px solid var(--line); }
+  header{ display:flex; align-items:center; justify-content:space-between; margin-bottom:30px; }
+  .brand{ font-size:14px; font-weight:600; letter-spacing:.3px; color:var(--muted); }
+  .qd{ font-size:11.5px; color:var(--faint); }
+
+  .hero{ display:flex; align-items:center; gap:15px; margin-bottom:26px; }
+  .dot{ width:14px; height:14px; border-radius:50%; flex:0 0 auto; background:var(--faint);
         transition:background .25s, box-shadow .25s; }
-  .is-on   .dot{ background:var(--ok);   box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 18%,transparent); }
-  .is-mic  .dot{ background:var(--warn); box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 18%,transparent); }
-  .is-mute .dot{ background:var(--stop); box-shadow:0 0 0 4px color-mix(in srgb,var(--stop) 18%,transparent); }
-  .state{ font-size:20px; font-weight:650; letter-spacing:-.2px; }
-  .statesub{ font-size:12.5px; color:var(--muted); margin-top:1px; }
+  .is-on   .dot{ background:var(--ok);   box-shadow:0 0 0 5px color-mix(in srgb,var(--ok) 18%,transparent); }
+  .is-mic  .dot{ background:var(--warn); box-shadow:0 0 0 5px color-mix(in srgb,var(--warn) 18%,transparent); }
+  .is-mute .dot{ background:var(--stop); box-shadow:0 0 0 5px color-mix(in srgb,var(--stop) 18%,transparent); }
+  .state{ font-size:28px; font-weight:650; letter-spacing:-.5px; line-height:1.1; }
+  .statesub{ font-size:13px; color:var(--muted); margin-top:3px; }
 
-  .toggle{ width:100%; font:inherit; font-weight:600; font-size:15px; padding:13px;
-           border-radius:12px; cursor:pointer; border:1px solid var(--line);
+  .toggle{ width:100%; font:inherit; font-weight:600; font-size:15.5px; padding:15px;
+           border-radius:13px; cursor:pointer; border:1px solid var(--line);
            background:var(--hover); color:var(--fg); transition:transform .05s, filter .15s; }
   .toggle:hover{ filter:brightness(1.06); }
   .toggle:active{ transform:scale(.985); }
   .toggle.resume{ background:var(--ok); border-color:var(--ok); color:#042a1c; }
-  .chips{ display:flex; gap:8px; margin-top:10px; }
-  .chips button{ flex:1; font:inherit; font-size:12.5px; font-weight:550; color:var(--muted);
-                 padding:8px; border-radius:9px; cursor:pointer; background:transparent;
+  .chips{ display:flex; gap:9px; margin-top:12px; }
+  .chips button{ flex:1; font:inherit; font-size:13px; font-weight:550; color:var(--muted);
+                 padding:10px; border-radius:10px; cursor:pointer; background:transparent;
                  border:1px solid var(--line); transition:background .15s, color .15s; }
   .chips button:hover{ background:var(--hover); color:var(--fg); }
 
-  .rule{ display:flex; align-items:center; gap:10px; margin:20px 0 6px; }
-  .rule span{ font-size:11px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; color:var(--faint); }
-  .rule:before,.rule:after{ content:""; height:1px; background:var(--line); flex:1; }
-  .rule:before{ flex:0 0 0; }
+  .feed{ display:flex; flex-direction:column; min-height:0; padding:30px 14px 10px 30px; }
+  .rule{ display:flex; align-items:center; gap:12px; margin:0 16px 4px 0; }
+  .rule span{ font-size:11.5px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; color:var(--faint); }
+  .rule:after{ content:""; height:1px; background:var(--line); flex:1; }
 
-  .hist{ list-style:none; margin:0; padding:0; max-height:340px; overflow-y:auto; }
-  .hist::-webkit-scrollbar{ width:8px; }
+  .hist{ list-style:none; margin:0; padding:0 16px 0 0; flex:1; overflow-y:auto; }
+  .hist::-webkit-scrollbar{ width:9px; }
   .hist::-webkit-scrollbar-thumb{ background:var(--line); border-radius:8px; }
-  .hitem{ display:grid; grid-template-columns:auto 1fr auto; align-items:baseline; gap:10px;
-          padding:9px 2px; border-bottom:1px solid var(--line); }
+  .hitem{ display:grid; grid-template-columns:auto 1fr auto; align-items:baseline; gap:13px;
+          padding:12px 2px; border-bottom:1px solid var(--line); }
   .hitem:last-child{ border-bottom:0; }
-  .hic{ font-size:12px; line-height:1.2; opacity:.9; }
+  .hic{ font-size:14px; line-height:1.2; opacity:.9; }
   .hbody{ min-width:0; }
-  .htext{ font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .htext{ font-size:14.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .k-mute .htext,.k-drop .htext{ color:var(--muted); }
-  .hmeta{ font-size:11px; color:var(--faint); margin-top:1px; }
-  .htime{ font-size:11px; color:var(--faint); white-space:nowrap; }
-  .empty{ text-align:center; color:var(--faint); font-size:12.5px; padding:22px 0; }
+  .hmeta{ font-size:12px; color:var(--faint); margin-top:2px; }
+  .htime{ font-size:12px; color:var(--faint); white-space:nowrap; }
+  .empty{ text-align:center; color:var(--faint); font-size:13px; padding:34px 0; }
+
+  @media (max-width:720px){
+    body{ align-items:flex-start; padding:20px 14px; }
+    .card{ grid-template-columns:1fr; height:auto; max-width:440px; }
+    .controls{ border-right:0; border-bottom:1px solid var(--line); padding:24px; }
+    header{ margin-bottom:20px; }
+    .hero{ margin-bottom:18px; }
+    .state{ font-size:23px; }
+    .feed{ padding:22px 8px 8px 22px; }
+    .hist{ max-height:48vh; }
+  }
 </style>
 </head>
 <body>
   <div class="card">
-    <header>
-      <span class="brand">speak when done</span>
-      <span class="qd" id="qd"></span>
-    </header>
+    <aside class="controls">
+      <header>
+        <span class="brand">speak when done</span>
+        <span class="qd" id="qd"></span>
+      </header>
 
-    <div class="hero">
-      <span class="dot" id="dot"></span>
-      <div>
-        <div class="state" id="state">…</div>
-        <div class="statesub" id="statesub"></div>
+      <div class="hero">
+        <span class="dot" id="dot"></span>
+        <div>
+          <div class="state" id="state">…</div>
+          <div class="statesub" id="statesub"></div>
+        </div>
       </div>
-    </div>
 
-    <button class="toggle" id="toggle" onclick="toggleMute()"></button>
-    <div class="chips" id="chips">
-      <button onclick="pause(15)">15 min</button>
-      <button onclick="pause(30)">30 min</button>
-      <button onclick="pause(60)">1 hour</button>
-    </div>
+      <button class="toggle" id="toggle" onclick="toggleMute()"></button>
+      <div class="chips" id="chips">
+        <button onclick="pause(15)">15 min</button>
+        <button onclick="pause(30)">30 min</button>
+        <button onclick="pause(60)">1 hour</button>
+      </div>
+    </aside>
 
-    <div class="rule"><span>Recent</span></div>
-    <ul class="hist" id="hist"></ul>
+    <section class="feed">
+      <div class="rule"><span>Recent</span></div>
+      <ul class="hist" id="hist"></ul>
+    </section>
   </div>
 <script>
   let cur = {};
