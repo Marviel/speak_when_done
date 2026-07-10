@@ -157,6 +157,12 @@ speak_when_done --text "Hello" --voice my_voice.safetensors
 
 > **Note:** Voice cloning requires accepting the Hugging Face license at [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) and logging in with `uvx hf auth login`.
 
+Clone quality depends mostly on the source clip, not the model — see
+[docs/voice-cloning-tips.md](docs/voice-cloning-tips.md) for source-selection
+and cleanup lessons (what clones well, demucs, speaker filtering, loudnorm
+artifacts), plus [contrib/filter_speaker.py](contrib/filter_speaker.py) for
+extracting a single speaker from interview/compilation audio.
+
 ### Voice warmup
 
 When using voice cloning, the first few frames can be unstable. Use `--warmup` to prepend filler text that absorbs this:
