@@ -131,6 +131,43 @@ When using the speak_when_done MCP:
 - Do not use speak for routine responses or simple questions
 ```
 
+## Shared warm daemon (optional)
+
+The stdio MCP server works per session, but every session spawns its own
+process and every `speak()` loads the TTS model cold. If you run **many
+concurrent sessions** (multiple editors, worktrees, agents), the daemon mode
+collapses all of that into ONE resident process:
+
+```bash
+pip install "speak-when-done[daemon]"
+python -m speak_when_done.daemon        # serves http://127.0.0.1:9876/mcp
+```
+
+Each session then registers the server over HTTP instead of stdio —
+`{"type": "http", "url": "http://127.0.0.1:9876/mcp"}` — zero per-session
+processes, model loaded once.
+
+- **Async FIFO queue**: `speak` validates, enqueues, and returns immediately
+  (`queued: true, position: N`). One background worker synthesizes and plays
+  strictly in arrival order, so audio from different sessions never overlaps
+  and MCP requests never block on synthesis.
+- **Keep-warm**: an idle-timer generation (discarded, never played) keeps the
+  model weights paged in; a watchdog logs a WARNING when one synthesis runs
+  long (the memory-pressure signature).
+- **Staleness guard**: messages older than 10 minutes at dequeue are dropped.
+- **Pause / mute control page** at `http://127.0.0.1:9877/`: mute on demand or
+  for 15/30/60 minutes, live status (On / Quiet (mic in use) / Muted), queue
+  depth, and a recent-notifications feed. Scriptable:
+  `curl -X POST 'http://127.0.0.1:9877/pause?minutes=30'`.
+- **Meeting suppression stays fresh**: long-lived processes accumulate a stale
+  CoreAudio HAL cache, so the daemon delegates mic checks to a throwaway
+  subprocess (~0.1 s) that always reads the current state.
+
+Tunables (env): `SPEAK_WHEN_DONE_PORT`, `SPEAK_WHEN_DONE_CONTROL_PORT`,
+`SPEAK_WHEN_DONE_QUEUE_MAX`, `SPEAK_WHEN_DONE_STALE_AFTER_S`,
+`SPEAK_WHEN_DONE_KEEP_WARM_IDLE_S`, `SPEAK_WHEN_DONE_VOICE` (default voice).
+Run it under launchd/systemd with `KeepAlive` for auto-restart.
+
 ## Voices
 
 ### Built-in voices

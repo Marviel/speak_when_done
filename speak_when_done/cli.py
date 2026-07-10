@@ -13,7 +13,9 @@ import argparse
 import json
 import sys
 
-from . import speak, list_voices
+import os
+
+from . import _CALL_LOG, speak, list_voices
 from .voices import load_profiles, get_profile, get_default_profile_name
 
 
@@ -73,7 +75,34 @@ def main():
         help="Output the resolved profile as JSON (for use by hooks/scripts)",
     )
 
+    parser.add_argument(
+        "--tail",
+        type=int,
+        nargs="?",
+        const=20,
+        metavar="N",
+        help="Print the last N call-log records (default 20) and exit",
+    )
     args = parser.parse_args()
+
+    if args.tail is not None:
+        if not os.path.exists(_CALL_LOG):
+            print(f"(no call log yet at {_CALL_LOG})")
+            sys.exit(0)
+        with open(_CALL_LOG) as f:
+            lines = f.readlines()
+        for line in lines[-args.tail:]:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                print(line.rstrip())
+                continue
+            ts = r.get("ts", "?")
+            event = r.get("event", "?")
+            voice = (r.get("voice") or "-").rsplit("/", 1)[-1]
+            extra = r.get("reason") or ""
+            print(f"{ts}  {event:18s}  {voice:28s}  {extra}")
+        sys.exit(0)
 
     # Handle --list-voices
     if args.list_voices:
