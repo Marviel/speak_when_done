@@ -5,11 +5,15 @@ description = "Text-to-speech with automatic temp file handling, plus MCP server
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.9.0",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+# The shared warm daemon keeps the Pocket TTS model resident and imports
+# pocket_tts directly (the CLI/stdio paths shell out to `uvx pocket-tts@2.1.0`
+# instead — keep the versions in step, see _POCKET_TTS_SPEC in __init__.py).
+daemon = ["pocket-tts>=2.1.0,<3"]
 dev = ["pytest"]
 
 [project.scripts]
