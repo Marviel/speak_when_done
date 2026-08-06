@@ -39,18 +39,25 @@ def test_speak_suppressed_when_mic_active():
 
 
 def test_speak_not_suppressed_when_mic_inactive():
-    """speak() proceeds normally when mic is not active and verifies check ran."""
+    """speak() proceeds normally when mic is not active and verifies check ran.
+
+    The guard is polled more than once by design: at entry, again after TTS
+    generation, and throughout playback. A single check would only cover the
+    instant speech was requested, which let a user who started dictating during
+    generation get talked over.
+    """
     from speak_when_done import speak
 
     with patch("speak_when_done.is_microphone_active", return_value=False) as mock_mic, \
          patch.object(sys, "platform", "darwin"), \
          patch("speak_when_done._get_audio_player", return_value=["afplay"]), \
+         patch("speak_when_done._play_audio", return_value={"success": True}), \
          patch("subprocess.run") as mock_run, \
          patch("os.unlink"):
         mock_run.return_value = MagicMock(returncode=0)
         result = speak("Hello", quiet=True)
 
-    mock_mic.assert_called_once()
+    assert mock_mic.call_count >= 2
     assert result["success"] is True
 
 
