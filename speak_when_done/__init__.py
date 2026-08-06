@@ -4,6 +4,7 @@ speak_when_done - Text-to-speech with automatic temp file handling.
 Generates speech using Kyutai's Pocket TTS, plays it, and cleans up.
 """
 
+from collections.abc import Callable
 import ctypes
 import ctypes.util
 import hashlib
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 __version__ = "0.1.0"
 
@@ -181,7 +183,13 @@ def _get_audio_player() -> list[str] | None:
     return None
 
 
-def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> dict:
+def _play_audio(
+    player_cmd: list[str],
+    audio_path: str,
+    timeout: int = 30,
+    abort_check: Callable[[], bool] | None = None,
+    poll_interval: float = 0.25,
+) -> dict:
     """
     Play an audio file using the specified player command.
 
@@ -189,23 +197,66 @@ def _play_audio(player_cmd: list[str], audio_path: str, timeout: int = 30) -> di
         player_cmd: The audio player command (may contain {path} placeholder).
         audio_path: Path to the audio file to play.
         timeout: Maximum time to wait for playback in seconds.
+        abort_check: Optional predicate polled during playback. When it returns
+            True, playback stops immediately. Used to cut speech off the moment
+            the microphone goes live, so the user is never talked over
+            mid-sentence.
+        poll_interval: Seconds between abort_check calls.
 
     Returns:
-        Dictionary with success status and any error details.
+        Dictionary with success status and any error details. A playback that
+        was cut short reports {"success": False, "suppressed": True}.
     """
     cmd = player_cmd + [audio_path]
 
-    play_result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    if abort_check is None:
+        play_result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
-    if play_result.returncode != 0:
+        if play_result.returncode != 0:
+            return {
+                "success": False,
+                "error": f"Audio playback failed: {play_result.stderr}",
+            }
+
+        return {"success": True}
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + timeout
+
+    while process.poll() is None:
+        if abort_check():
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            return {
+                "success": False,
+                "suppressed": True,
+                "reason": "microphone became active during playback",
+            }
+        if time.monotonic() > deadline:
+            process.kill()
+            process.wait()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        time.sleep(poll_interval)
+
+    stderr = process.stderr.read() if process.stderr else ""
+    if process.returncode != 0:
         return {
             "success": False,
-            "error": f"Audio playback failed: {play_result.stderr}",
+            "error": f"Audio playback failed: {stderr}",
         }
 
     return {"success": True}
@@ -336,8 +387,17 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
     Returns:
         Dictionary with success status and details.
     """
+    # Microphone guard (macOS only). Held as a predicate rather than a one-time
+    # boolean because the mic can go live at any point between here and the end
+    # of playback, and every one of those moments needs the same answer.
+    mic_guard = (
+        is_microphone_active
+        if suppress_in_meeting and sys.platform == "darwin"
+        else None
+    )
+
     # Check if mic is active (meeting in progress) — macOS only
-    if suppress_in_meeting and sys.platform == "darwin" and is_microphone_active():
+    if mic_guard is not None and mic_guard():
         return {
             "success": False,
             "suppressed": True,
@@ -398,8 +458,18 @@ def speak(message: str, voice: str = DEFAULT_VOICE, quiet: bool = False,
             if fast_path:
                 play_path = fast_path
 
-        # Play the audio file
-        play_result = _play_audio(player_cmd, play_path)
+        # TTS generation takes seconds, and the microphone can go live during
+        # them — which is exactly what happens when the user starts dictating
+        # while a notification is pending. Re-check before making any sound.
+        if mic_guard is not None and mic_guard():
+            return {
+                "success": False,
+                "suppressed": True,
+                "reason": "microphone became active during speech generation",
+            }
+
+        # Play the audio file, stopping early if the microphone goes live
+        play_result = _play_audio(player_cmd, play_path, abort_check=mic_guard)
         if fast_path:
             try:
                 os.unlink(fast_path)

@@ -226,7 +226,13 @@ Config is also settable via environment variables:
 
 ## Meeting suppression
 
-On macOS, speech is automatically suppressed when a microphone is active (e.g. during a video call). Override with `--ignore-meeting`.
+On macOS, speech is automatically suppressed when a microphone is active (e.g. during a video call, or while dictating). Override with `--ignore-meeting`.
+
+The microphone is checked continuously, not once:
+
+1. When speech is requested — nothing is generated if you are already talking.
+2. After TTS generation, before any sound is made — generation takes seconds, and you may have started talking during them.
+3. Throughout playback — if the microphone goes live mid-sentence, playback stops immediately rather than talking over you.
 
 ## Built on pocket-tts
 
